@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=75,<82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutefish"
+version = "0.1.0.dev1"
+description = "Local-first CuteFish assistant"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "pydantic>=2.9,<3.0",
+  "sqlalchemy[asyncio]>=2.0.36,<3.0",
+  "aiosqlite>=0.20,<1.0",
+  "argon2-cffi>=23.1,<26.0",
+  "openai>=1.55,<2.0",
+  "Pillow>=11.0,<13.0",
+]
+
+[project.scripts]
+cutefish-migrate = "cutefish.migration.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10.0",
+  "pytest-asyncio>=0.24,<2.0",
+  "httpx>=0.27,<1.0",
+]
+desktop = ["pywebview>=5.4,<7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"

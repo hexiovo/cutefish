@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node.js
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
+
+# Local configuration, secrets, databases, and runtime state
+.env
+.env.*
+!.env.example
+secrets/
+runtime_data/
+host.local.json
+*.sqlite3
+*.db
+logs/
+
+# Models, recordings, and migration bundles
+models/
+audio/
+migration_exports/
+migration_staging/
+
+# Python build metadata
+*.egg-info/
+
+# Local database sidecar files
+*.sqlite3-shm
+*.sqlite3-wal
+*.log

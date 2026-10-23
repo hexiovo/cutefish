@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cutefish.local/schemas/migration-manifest-v1.schema.json",
+  "title": "CuteFish migration manifest v1",
+  "description": "Portable metadata for a sanitized, offline migration snapshot. This schema does not make a package safe to import by itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "manifest_version",
+    "export_id",
+    "created_at",
+    "source",
+    "database",
+    "files",
+    "logical_roots",
+    "excluded_categories",
+    "restore_policy"
+  ],
+  "properties": {
+    "format": { "const": "cutefish-migration" },
+    "manifest_version": { "const": 1 },
+    "export_id": { "type": "string", "format": "uuid" },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "app_version", "schema_version", "deployment_profile"],
+      "properties": {
+        "host_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "app_version": {
+          "type": "string",
+          "description": "PEP 440-compatible package version, recorded as-is from package metadata.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "deployment_profile": { "const": "local_trial" }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "filename",
+        "sha256",
+        "size_bytes",
+        "schema_version",
+        "sqlite_integrity_check",
+        "foreign_key_check",
+        "sanitized",
+        "excluded_tables"
+      ],
+      "properties": {
+        "filename": { "const": "cutefish.sqlite3" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "sqlite_integrity_check": { "const": "ok" },
+        "foreign_key_check": { "const": "ok" },
+        "sanitized": { "const": true },
+        "excluded_tables": {
+          "const": ["secret_record", "auth_session", "admin_account"]
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "root_key", "relative_path", "sha256", "size_bytes"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "root_key": {
+            "description": "Transferable file roots only; machine cache, model, and temporary content are excluded.",
+            "enum": ["data_root", "gallery_root", "room_root", "backup_root"]
+          },
+          "relative_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*:)(?!.*//)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "logical_roots": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "allOf": [
+        { "contains": { "properties": { "root_key": { "const": "data_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "gallery_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "room_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "backup_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "cache_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "model_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 },
+        { "contains": { "properties": { "root_key": { "const": "temp_root" } }, "required": ["root_key"] }, "minContains": 1, "maxContains": 1 }
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["root_key", "mapped"],
+        "properties": {
+          "root_key": {
+            "enum": ["data_root", "gallery_root", "room_root", "backup_root", "cache_root", "model_root", "temp_root"]
+          },
+          "mapped": { "type": "boolean" }
+        }
+      }
+    },
+    "excluded_categories": {
+      "const": [
+        "secrets",
+        "auth_sessions",
+        "admin_credentials",
+        "cookies",
+        "browser_profiles",
+        "machine_credentials",
+        "model_weights",
+        "venv",
+        "node_modules",
+        "temporary_cache"
+      ]
+    },
+    "restore_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_profile",
+        "external_actions_enabled",
+        "outbox_dispatch_enabled",
+        "paid_provider_calls_enabled",
+        "scheduling_enabled",
+        "auto_start_enabled",
+        "task_auto_resume",
+        "credentials_state",
+        "requires_host_bindings"
+      ],
+      "properties": {
+        "deployment_profile": { "const": "target_staging" },
+        "external_actions_enabled": { "const": false },
+        "outbox_dispatch_enabled": { "const": false },
+        "paid_provider_calls_enabled": { "const": false },
+        "scheduling_enabled": { "const": false },
+        "auto_start_enabled": { "const": false },
+        "task_auto_resume": { "const": false },
+        "credentials_state": { "const": "reconfigure_on_target" },
+        "requires_host_bindings": { "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}
