@@ -533,8 +533,15 @@ def _generate(request: dict[str, Any], model_path: Path, workspace: Path, output
                 pass
 
 
+def _emit_json(payload: dict[str, Any], *, compact: bool = False) -> None:
+    options = {"separators": (",", ":")} if compact else {}
+    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, **options).encode("utf-8")
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
+
+
 def _emit_error(code: str) -> int:
-    print(json.dumps({"error": code}, ensure_ascii=False, allow_nan=False))
+    _emit_json({"error": code})
     return 2
 
 
@@ -562,7 +569,7 @@ def main() -> int:
 
         with redirect_stdout(sys.stderr):
             result = _generate(request, model_path, workspace, output_path, model_id, revision, fingerprint)
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+        _emit_json(result, compact=True)
         return 0
     except WorkerFailure as exc:
         return _emit_error(exc.code)

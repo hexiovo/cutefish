@@ -1,8 +1,8 @@
 # QUICKSTART_AGENT / CuteFish Codex 4.9
 
-> 先读本文件与 AGENTS.md；当前任务处于 S04。项目实施、本机核验、目标核验和正式启用分开记录；源执行包只读。
+> 先读本文件与 AGENTS.md；S08 本机 Qwen 两阶段技术验收已接受。项目实施、本机核验、目标核验和正式启用分开记录；源执行包只读。
 
-当前阶段：workflow_review 批准的 `execution / S04`（计划 hash `8522a37a703c24d176db6551a17299863310fcdbc7c72f3e8f36978d5cdd984f`）；S01–S03 bounded 范围已独立验收 PASS。S04 内容修订 quote/content 核对 PASS，canonical content hash 为 `bd230c743d85aba798f0dfc5ffaddacf62223aefd85a46a450bce398025c23b5`；最终 reviewer 总验收记录见 `../manage/reports/S04-内容修订与总验收.md`。本机离线交付材料已收口；真实 owner 导入、试聊/批准、目标机及 production 仍 pending。
+当前状态：S08 已 ACCEPTED / phasecomplete（sequence 189），canonical acceptance hash `e081820a7d9e52273773dd9e5972568a1a351c3c9399e969aaddff965bcada28`；本机固定 Qwen 资源及指定短句 VoiceDesign→Base 技术验收通过。当前信息性交接 hash `fe72a2ea103c1762257f37dbdab298212e425ab487325313b74fb4cd3532685d`。可以试听 `../manage/resources/qwen-voice-design-20261024.wav` 与 `../manage/resources/qwen-base-preview-20261024.wav`；人工音质判断/批准、QQ/codec、付费视觉、目标机及 production 仍 pending。S06 旧 partial 和 supplement-03-v1 均作为历史保留。
 唯一交付状态源：`../manage/feature-status.json`，按 P00–P14 分别记录实现、本机核验、目标核验和正式启用证据。
 当前 Git 提交/推送结果记录在工作区外部管理目录 `../manage/HANDOFF.md`。不扩大审查、不重跑旧验证。owner 尚未导入 bundle 或启动 calibration 试聊；当前仅 local_trial 手动 loopback，不访问真实站点、不调用付费 API、不外发、不执行迁移。
 
@@ -19,14 +19,14 @@
 | P07 | partial | 仅有本地图片解码；仍需图像请求/响应 adapter 代码，视觉能力与计价未证实 | feature-status.json |
 | P08 | partial | S03 受限集成基础与 mock 测试；站点目标/真实 handler 未配置 | `../manage/reports\S03-集成接口合同.md` |
 | P09 | partial | 持久候选/本地控制已有；主动调度和真实互动未启用 | feature-status.json |
-| P10 | partial | SAPI 仅普通朗读，不能满足原创表达/指令控制；ASR 模型未提供，未试听 | feature-status.json |
+| P10 | partial | S05 ASR 已验收；S08 Qwen 固定资源和本机两阶段短句技术验收通过，等待 owner 试听/批准 | `../manage/feature-status.json` 与 `../manage/reports/acceptance-S08-v1/report.html` |
 | P11 | partial | QQ语音发送结构有部分实现；NapCat codec 未实证，默认仍文字 | feature-status.json |
 | P12 | partial | S03 证据绑定动作预览；生产 handler 为空、未真实派发 | `../manage/reports\S03-集成接口合同.md` |
 | P13 | partial | 迁移说明/schema/template 和薄 CLI；只验证帮助输出，未运行迁移 | `../manage/迁移说明.md` |
 | P14 | local complete | 本机交接材料与最终验收副本已收口；目标机未知 | 目标机交接与 production 启用待后续独立完成 |
 ## 人工交接要点
 ### active_context
-S01（P00–P02）、S02（P03–P06）和 S03 bounded offline 范围已独立验收 PASS。当前为 workflow_review 批准的 S04，计划 hash `8522a37a703c24d176db6551a17299863310fcdbc7c72f3e8f36978d5cdd984f`；旧 S04 receipt 保留，当前 bundle quote/content 核对及最终 reviewer note 已完成。保留已验收底座，不做无关重构。所有 P00–P14 状态以 `../manage/feature-status.json` 为准。
+已接受的各阶段范围与边界见 `../manage/feature-status.json` 及 `../manage/HANDOFF.md`。S08 本机 Qwen 固定资源和指定短句 VoiceDesign→Base 技术链已 ACCEPTED / phasecomplete（sequence 189）；S08 acceptance hash 为 `e081820a7d9e52273773dd9e5972568a1a351c3c9399e969aaddff965bcada28`，supplement-03 handoff-v2 是信息性交接页，hash `fe72a2ea103c1762257f37dbdab298212e425ab487325313b74fb4cd3532685d`。S06 partial/blocked 和 supplement-03-v1 保留历史，不覆盖。当前没有待办的HexiPlan审批或模型验证；保留 local_trial 与所有外部/production边界。
 ### decisions
 ```json
 [
@@ -57,22 +57,20 @@ S01（P00–P02）、S02（P03–P06）和 S03 bounded offline 范围已独立�
 ```
 ### uncommitted_changes
 ```json
-[
-  "master 工作区尚有未提交工程变更；以 git status 为准"
-]
+[]
 ```
 ### blockers
 ```json
 [
-  "S04 当前内容收敛版本待一次 loader quote/content 核对和 reviewer note",
-  "owner 尚未在 Persona 页面实际导入 bundle；真实模型调用、真人反馈与人格批准均未进行",
+  "owner 尚未在 Persona 页面导入 bundle 或进行 DeepSeek calibration 试聊；真人反馈与人格批准未完成",
+  "S08 两段隔离 WAV 等待 owner 主观试听/反馈；准确声音版本尚未批准",
   "browser visual 为 NOT_RUN；没有真实浏览器验收",
-  "P03 token 容量目标未达成，P07 视觉请求/响应 adapter 尚未实现",
+  "P03 token 容量目标未达成；P07 adapter 已 code-ready，但真实 provider 能力、价格与图片推理未验证",
   "目标机未知不阻塞当前本机实施"
 ]
 ```
 ### next_exact_action
-完成 scout 对当前私有 bundle 的一次 quote/content 核对，再由 reviewer 更新 note 并收尾 final HTML/Git 白名单。旧 S04 receipt 保留；不重跑旧验证。保持 local_trial；实际 bundle 导入、模型试聊、真实站点、QQ 外发、迁移和目标机验证均未执行。
+如 owner 愿意，按 `../manage/prompts/语音试听.txt` 人工播放 `../manage/resources/qwen-voice-design-20261024.wav` 和 `../manage/resources/qwen-base-preview-20261024.wav` 并记录反馈；不重跑 Qwen 或资源校验。仓库内 worker 修复、定向测试和指针文档已按白名单推送到 `master`；外部 manage 报告与配置仍留在本机工作区，最终 commit/远端状态见 `../manage/HANDOFF.md`。之后仅按用户新指示推进仍待真人输入或专项验证的事项。
 ### accepted_not_implemented
 ```json
 [
