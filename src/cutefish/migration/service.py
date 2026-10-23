@@ -688,6 +688,8 @@ def _validate_media_selection(
     connection: sqlite3.Connection,
     media_ids: Sequence[str],
     policy: MigrationPolicy,
+    *,
+    candidate_media: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     if len(media_ids) > policy.max_media_files or len(set(media_ids)) != len(media_ids):
         raise MigrationError("invalid_media_selection", "媒体 ID 数量超限或存在重复项。", 422)
@@ -706,6 +708,7 @@ def _validate_media_selection(
     if len(by_id) != len(media_ids):
         raise MigrationError("media_not_registered", "至少一个媒体 ID 未在数据库中登记。", 404)
     items: list[dict[str, Any]] = []
+    candidate_media = candidate_media or {}
     for media_id in media_ids:
         row = by_id[media_id]
         root_key = str(row["root_key"])
@@ -718,8 +721,19 @@ def _validate_media_selection(
             and row["asset_class"] == "generated_voice"
             and row["artifact_purpose"] == "approval_preview"
         )
+        candidate_id = candidate_media.get(media_id)
+        is_candidate_reference = (
+            candidate_id is not None
+            and root_key == "data_root"
+            and relative_path == f"voice-candidates/{candidate_id}.wav"
+            and str(row["mime_type"] or "").casefold() == "audio/wav"
+            and row["asset_class"] == "voice_candidate"
+            and row["artifact_purpose"] == "candidate_reference"
+            and source_scope == "calibration"
+            and not bool(row["role_use_approved"])
+        )
         if source_scope not in {"production", "calibration"} or not (
-            bool(row["role_use_approved"]) or is_approved_voice_audition
+            bool(row["role_use_approved"]) or is_approved_voice_audition or is_candidate_reference
         ):
             raise MigrationError("media_scope_not_approved", "媒体用途范围未获迁移所需批准。", 403)
         try:
@@ -743,9 +757,124 @@ def _validate_media_selection(
                 "byte_length": size,
                 "source_scope": source_scope,
                 "version": int(row["version"]),
+                "role_use_approved": bool(row["role_use_approved"]),
+                "reason": (
+                    "voice_candidate_reference"
+                    if is_candidate_reference
+                    else "approved_voice_preview"
+                    if is_approved_voice_audition and not bool(row["role_use_approved"])
+                    else "selected_media"
+                ),
+                "candidate_id": candidate_id if is_candidate_reference else None,
             }
         )
     return items
+
+
+def _voice_candidate_references(
+    connection: sqlite3.Connection,
+    policy: MigrationPolicy,
+) -> tuple[dict[str, str], dict[str, tuple[Any, ...]]]:
+    """Validate the whole-DB candidate dependency closure for a snapshot."""
+    tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "local_voice_candidate" not in tables:
+        return {}, {}
+    if "extension_managed_media" not in tables:
+        raise MigrationError("voice_candidate_reference_missing", "声线候选缺少受管媒体表。", 409)
+    rows = connection.execute(
+        "SELECT c.id AS candidate_id, c.origin, c.status, c.managed_media_id, "
+        "c.reference_relative_path, c.reference_sha256, "
+        "m.id AS media_id, m.root_key, m.relative_path, m.sha256, m.mime_type, m.byte_length, "
+        "m.source_scope, m.role_use_approved, m.asset_class, m.artifact_purpose, m.artifact_state "
+        "FROM local_voice_candidate AS c "
+        "LEFT JOIN extension_managed_media AS m ON m.id = c.managed_media_id "
+        "ORDER BY c.id"
+    ).fetchall()
+    by_media: dict[str, str] = {}
+    signatures: dict[str, tuple[Any, ...]] = {}
+    for row in rows:
+        candidate_id = str(row["candidate_id"] or "")
+        media_id = str(row["managed_media_id"] or "")
+        relative_path = str(row["reference_relative_path"] or "")
+        reference_hash = str(row["reference_sha256"] or "").lower()
+        if (
+            not candidate_id
+            or len(candidate_id) > 128
+            or not media_id
+            or row["origin"] != "qwen_voice_design"
+            or row["status"] != "unapproved"
+            or row["media_id"] != media_id
+            or row["root_key"] != "data_root"
+            or relative_path != f"voice-candidates/{candidate_id}.wav"
+            or row["relative_path"] != relative_path
+            or not _safe_relative_path(relative_path)
+            or not _SHA256_HEX.fullmatch(reference_hash)
+            or str(row["sha256"] or "").lower() != reference_hash
+            or str(row["mime_type"] or "").casefold() != "audio/wav"
+            or row["asset_class"] != "voice_candidate"
+            or row["artifact_purpose"] != "candidate_reference"
+            or row["artifact_state"] != "unapproved"
+            or row["source_scope"] != "calibration"
+            or bool(row["role_use_approved"])
+        ):
+            raise MigrationError(
+                "voice_candidate_reference_invalid",
+                "声线候选与其受管参考 WAV 登记不一致，拒绝导出不完整快照。",
+                409,
+            )
+        try:
+            size = int(row["byte_length"])
+        except (TypeError, ValueError) as exc:
+            raise MigrationError("voice_candidate_reference_invalid", "声线候选 WAV 长度登记无效。", 409) from exc
+        if size <= 0 or size > policy.max_media_file_bytes:
+            raise MigrationError("media_size_limit", "声线候选 WAV 超过迁移单文件大小限制。", 413)
+        if media_id in by_media or candidate_id in signatures:
+            raise MigrationError("voice_candidate_reference_duplicate", "声线候选引用重复，拒绝导出。", 409)
+        by_media[media_id] = candidate_id
+        signatures[candidate_id] = (
+            row["origin"], row["status"], media_id, relative_path, reference_hash,
+            row["root_key"], row["sha256"], row["byte_length"], row["mime_type"],
+            row["source_scope"], row["role_use_approved"], row["asset_class"],
+            row["artifact_purpose"], row["artifact_state"],
+        )
+    if len(by_media) > policy.max_media_files:
+        raise MigrationError("media_count_limit", "声线候选参考 WAV 数量超过迁移媒体数量限制。", 413)
+    return by_media, signatures
+
+
+_SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
+
+
+def _current_voice_candidate_signature(
+    database_path: Path,
+    candidate_ids: Sequence[str],
+) -> dict[str, tuple[Any, ...]]:
+    if not candidate_ids:
+        return {}
+    connection = _read_only_connection(database_path)
+    try:
+        placeholders = ",".join("?" for _ in candidate_ids)
+        rows = connection.execute(
+            "SELECT c.id AS candidate_id, c.origin, c.status, c.managed_media_id, "
+            "c.reference_relative_path, c.reference_sha256, "
+            "m.root_key, m.sha256, m.byte_length, m.mime_type, m.source_scope, m.role_use_approved, "
+            "m.asset_class, m.artifact_purpose, m.artifact_state "
+            "FROM local_voice_candidate AS c "
+            "LEFT JOIN extension_managed_media AS m ON m.id = c.managed_media_id "
+            f"WHERE c.id IN ({placeholders})",
+            tuple(candidate_ids),
+        ).fetchall()
+        result: dict[str, tuple[Any, ...]] = {}
+        for row in rows:
+            result[str(row["candidate_id"])] = (
+                row["origin"], row["status"], row["managed_media_id"], row["reference_relative_path"],
+                str(row["reference_sha256"] or "").lower(), row["root_key"], row["sha256"],
+                row["byte_length"], row["mime_type"], row["source_scope"], row["role_use_approved"],
+                row["asset_class"], row["artifact_purpose"], row["artifact_state"],
+            )
+        return result
+    finally:
+        connection.close()
 
 
 def _voice_approval_preview_ids(connection: sqlite3.Connection) -> set[str]:
@@ -791,7 +920,7 @@ def _expected_media_signature(items: Sequence[Mapping[str, Any]]) -> dict[str, t
     return {
         str(item["stable_id"]): (
             item["root_key"], item["relative_path"], item["sha256"], item["kind"],
-            item["byte_length"], item["source_scope"], 1, item["version"],
+            item["byte_length"], item["source_scope"], bool(item.get("role_use_approved", True)), item["version"],
         )
         for item in items
     }
@@ -816,10 +945,25 @@ def _copy_verified_media(
     result: list[ManifestFile] = []
     total = 0
     for item in items:
-        source = paths.resolve(str(item["root_key"]), str(item["relative_path"]), must_exist=True)
-        _assert_no_link_components(source)
-        digest, size = _hash_file(source, max_bytes=policy.max_media_file_bytes)
+        try:
+            source = paths.resolve(str(item["root_key"]), str(item["relative_path"]), must_exist=True)
+            _assert_no_link_components(source)
+            digest, size = _hash_file(source, max_bytes=policy.max_media_file_bytes)
+        except (PathPolicyError, FileNotFoundError, OSError, ValueError) as exc:
+            if item.get("reason") == "voice_candidate_reference":
+                raise MigrationError(
+                    "voice_candidate_reference_missing",
+                    "声线候选参考 WAV 缺失或不在受控目录中，拒绝生成不完整迁移包。",
+                    409,
+                ) from exc
+            raise MigrationError("media_unavailable", "登记媒体当前缺失或不在受控目录中。", 409) from exc
         if digest != item["sha256"] or size != item["byte_length"]:
+            if item.get("reason") == "voice_candidate_reference":
+                raise MigrationError(
+                    "voice_candidate_reference_mismatch",
+                    "声线候选参考 WAV 与登记 hash 或长度不一致，拒绝生成不完整迁移包。",
+                    409,
+                )
             raise MigrationError("media_source_changed", "媒体文件内容与登记的版本或哈希不一致。", 409)
         total += size
         if total > policy.max_media_total_bytes:
@@ -845,6 +989,8 @@ def _copy_verified_media(
                 byte_length=size,
                 source_scope=str(item["source_scope"]),
                 version=int(item["version"]),
+                reason=str(item.get("reason") or "selected_media"),
+                candidate_id=item.get("candidate_id"),
             )
         )
     return tuple(result)
@@ -948,6 +1094,53 @@ def _validate_database(path: Path, expected_schema_version: int) -> tuple[list[s
         connection.close()
 
 
+def _validate_candidate_manifest_closure(
+    database_path: Path,
+    manifest_files: Sequence[ManifestFile],
+    policy: MigrationPolicy,
+) -> None:
+    """Reject bundles whose database has candidates without their required WAV."""
+    connection = _read_only_connection(database_path)
+    try:
+        candidate_media, signatures = _voice_candidate_references(connection, policy)
+    finally:
+        connection.close()
+    by_media = {item.stable_id: item for item in manifest_files}
+    for media_id, candidate_id in candidate_media.items():
+        item = by_media.get(media_id)
+        if (
+            item is None
+            or item.reason != "voice_candidate_reference"
+            or item.candidate_id != candidate_id
+            or item.root_key != "data_root"
+            or item.relative_path != f"voice-candidates/{candidate_id}.wav"
+            or item.sha256 != signatures[candidate_id][4]
+            or item.byte_length != int(signatures[candidate_id][7])
+            or item.kind != signatures[candidate_id][8]
+            or item.source_scope != signatures[candidate_id][9]
+        ):
+            raise MigrationError(
+                "voice_candidate_reference_missing",
+                "迁移清单没有包含数据库中全部声线候选所需的参考 WAV。",
+                422,
+            )
+    for item in manifest_files:
+        expected_candidate = candidate_media.get(item.stable_id)
+        if item.reason == "voice_candidate_reference":
+            if expected_candidate is None or item.candidate_id != expected_candidate:
+                raise MigrationError(
+                    "voice_candidate_reference_invalid",
+                    "迁移清单包含无对应候选记录的声线参考 WAV。",
+                    422,
+                )
+        elif expected_candidate is not None:
+            raise MigrationError(
+                "voice_candidate_reference_missing",
+                "迁移清单没有正确标注声线候选参考 WAV。",
+                422,
+            )
+
+
 def _walk_bundle(bundle_path: Path, manifest: MigrationManifest) -> list[str]:
     expected_files = {MANIFEST_FILENAME, MANIFEST_HASH_FILENAME, DATABASE_FILENAME}
     expected_dirs: set[str] = set()
@@ -1029,6 +1222,7 @@ def _validate_bundle_sync(bundle_path: Path, policy: MigrationPolicy) -> Validat
         db_errors, version = _validate_database(db_path, policy.expected_schema_version)
         if db_errors:
             raise MigrationError("database_validation_failed", db_errors[0], 422)
+        _validate_candidate_manifest_closure(db_path, manifest.files, policy)
         for item in manifest.files:
             file_path = bundle_path.joinpath(*PurePosixPath(item.bundle_path).parts)
             digest, size = _hash_file(file_path, max_bytes=policy.max_media_file_bytes)
@@ -1058,6 +1252,58 @@ def _validate_bundle_sync(bundle_path: Path, policy: MigrationPolicy) -> Validat
 async def validate_bundle(bundle_path: Path, policy: MigrationPolicy | None = None) -> ValidationResult:
     resolved_policy = policy or MigrationPolicy()
     return await asyncio.to_thread(_validate_bundle_sync, Path(bundle_path), resolved_policy)
+
+
+def _materialize_candidate_references(staging: Path, manifest: MigrationManifest, policy: MigrationPolicy) -> None:
+    """Place candidate WAVs under the target's controlled data_root for the normal reader."""
+    target_paths = HostPathResolver({"data_root": staging})
+    for item in manifest.files:
+        if item.reason != "voice_candidate_reference":
+            continue
+        expected_relative = f"voice-candidates/{item.candidate_id}.wav"
+        if (
+            item.root_key != "data_root"
+            or not item.candidate_id
+            or item.relative_path != expected_relative
+        ):
+            raise MigrationError(
+                "voice_candidate_reference_invalid",
+                "声线候选参考 WAV 的目标路径无效。",
+                422,
+            )
+        relative = _safe_relative_path(expected_relative)
+        try:
+            source_relative = _safe_relative_path(item.bundle_path)
+            source = target_paths.resolve("data_root", source_relative, must_exist=True)
+            destination = target_paths.resolve("data_root", relative, for_write=True)
+            _assert_no_link_components(source)
+            _assert_no_link_components(destination.parent)
+            if not source.is_file() or _is_link_or_junction(source) or destination.exists():
+                raise ValueError("candidate reference source or destination is unavailable")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _assert_no_link_components(destination.parent)
+            destination = target_paths.resolve("data_root", relative, for_write=True)
+            if destination.exists():
+                raise ValueError("candidate reference destination already exists")
+            with source.open("rb") as source_stream, destination.open("xb") as target_stream:
+                shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+                target_stream.flush()
+                os.fsync(target_stream.fileno())
+            digest, size = _hash_file(destination, max_bytes=policy.max_media_file_bytes)
+            if digest != item.sha256 or size != item.byte_length:
+                raise MigrationError(
+                    "voice_candidate_reference_mismatch",
+                    "导入后的声线候选 WAV 与清单校验值不一致。",
+                    409,
+                )
+        except MigrationError:
+            raise
+        except (PathPolicyError, FileNotFoundError, OSError, ValueError) as exc:
+            raise MigrationError(
+                "voice_candidate_reference_materialization_failed",
+                "声线候选参考 WAV 无法安全放入目标数据目录。",
+                409,
+            ) from exc
 
 
 def _export_bundle_sync(
@@ -1103,15 +1349,25 @@ def _export_bundle_sync(
         snapshot, _warnings, _table_count, _unused = _copy_snapshot_to_memory(
             database_path, root_policy.expected_schema_version
         )
+        candidate_media, candidate_signatures = _voice_candidate_references(snapshot, root_policy)
         selected_ids = list(media_ids)
         selected_id_set = set(selected_ids)
+        for candidate_media_id in sorted(candidate_media):
+            if candidate_media_id not in selected_id_set:
+                selected_ids.append(candidate_media_id)
+                selected_id_set.add(candidate_media_id)
         for preview_id in sorted(_voice_approval_preview_ids(snapshot)):
             if preview_id not in selected_id_set:
                 selected_ids.append(preview_id)
                 selected_id_set.add(preview_id)
         if len(selected_ids) > root_policy.max_media_files:
-            raise MigrationError("media_count_limit", "获批语音试听和所选媒体超过迁移媒体数量限制。", 413)
-        selected_media = _validate_media_selection(snapshot, selected_ids, root_policy)
+            raise MigrationError("media_count_limit", "声线候选、获批试听和所选媒体超过迁移媒体数量限制。", 413)
+        selected_media = _validate_media_selection(
+            snapshot,
+            selected_ids,
+            root_policy,
+            candidate_media=candidate_media,
+        )
         if len(selected_media) > root_policy.max_media_files:
             raise MigrationError("media_count_limit", "媒体数量超过迁移限制。", 413)
         _sanitize_snapshot(snapshot)
@@ -1124,6 +1380,9 @@ def _export_bundle_sync(
         current_signature = _current_media_signature(database_path, selected_media)
         if current_signature != _expected_media_signature(selected_media):
             raise MigrationError("media_batch_changed", "登记媒体在导出批次中发生变化；拒绝生成不一致迁移包。", 409)
+        current_candidates = _current_voice_candidate_signature(database_path, tuple(candidate_signatures))
+        if current_candidates != candidate_signatures:
+            raise MigrationError("media_batch_changed", "声线候选登记在导出批次中发生变化；拒绝生成不一致迁移包。", 409)
 
         export_id = str(uuid.uuid4())
         manifest = MigrationManifest(
@@ -1255,6 +1514,7 @@ def _import_staging_sync(
         ))
         if not second_validation.valid:
             raise MigrationError("staging_validation_failed", "导入临时区复核未通过。", 422)
+        _materialize_candidate_references(staging, manifest, policy)
         had_empty_target = target.exists()
         if had_empty_target:
             target.rmdir()

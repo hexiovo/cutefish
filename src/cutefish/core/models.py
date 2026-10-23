@@ -5,7 +5,20 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, JSON, LargeBinary, Numeric, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    LargeBinary,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -315,4 +328,38 @@ class ToolActionOutboxItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     sending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LocalVoiceCandidate(Base):
+    """Immutable metadata for an application-generated local voice reference."""
+
+    __tablename__ = "local_voice_candidate"
+    __table_args__ = (
+        UniqueConstraint("managed_media_id", name="uq_local_voice_candidate_media"),
+        Index("ix_local_voice_candidate_created", "created_at"),
+        CheckConstraint("seed >= 0 AND seed <= 4294967295", name="ck_local_voice_candidate_seed_u32"),
+        CheckConstraint("origin = 'qwen_voice_design'", name="ck_local_voice_candidate_origin"),
+        CheckConstraint("status = 'unapproved'", name="ck_local_voice_candidate_unapproved"),
+        CheckConstraint("length(ref_text) BETWEEN 1 AND 160", name="ck_local_voice_candidate_ref_text"),
+        CheckConstraint("length(style_prompt) BETWEEN 1 AND 500", name="ck_local_voice_candidate_style"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="qwen_voice_design")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="unapproved")
+    managed_media_id: Mapped[str] = mapped_column(
+        ForeignKey("extension_managed_media.id", ondelete="RESTRICT"), nullable=False
+    )
+    reference_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    reference_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    ref_text: Mapped[str] = mapped_column(Text, nullable=False)
+    style_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    design_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    design_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    design_resource_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    base_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_resource_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 

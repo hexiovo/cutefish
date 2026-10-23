@@ -498,6 +498,8 @@ class ChatService:
             usage=usage.as_dict(),
             dropped_history=built.dropped_history_count,
             prompt_bytes=built.utf8_bytes,
+            prompt_tokens_estimate=built.estimated_input_tokens,
+            prompt_token_estimate_status=built.token_estimate_status,
             input_message_id=inbound_id,
         )
 
@@ -649,6 +651,8 @@ class ChatService:
         usage: dict[str, Any],
         dropped_history: int,
         prompt_bytes: int,
+        prompt_tokens_estimate: int,
+        prompt_token_estimate_status: str,
         input_message_id: str,
     ) -> dict[str, Any]:
         response_id = str(uuid.uuid4())
@@ -693,6 +697,8 @@ class ChatService:
                         "budget_state": budget_state,
                         "dropped_history_messages": dropped_history,
                         "prompt_utf8_bytes": prompt_bytes,
+                        "prompt_tokens_estimate": prompt_tokens_estimate,
+                        "prompt_token_estimate_status": prompt_token_estimate_status,
                         "turn_state": "stale" if stale else "current",
                     },
                     created_at=now,

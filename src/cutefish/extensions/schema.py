@@ -21,6 +21,11 @@ async def ensure_compatible_schema(connection) -> None:
     )
     await _add_columns(
         connection,
+        "extension_voice_profile_version",
+        {"engine_config_json": "TEXT"},
+    )
+    await _add_columns(
+        connection,
         "extension_managed_media",
         {
             "sha256": "VARCHAR(64)",

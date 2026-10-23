@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from .models import Base, utc_now
 
 
-CURRENT_SCHEMA_VERSION = 4
-_SUPPORTED_LEGACY_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+CURRENT_SCHEMA_VERSION = 5
+_SUPPORTED_LEGACY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 _DRAFT_V2_COLUMNS = {
     # S02 is still being assembled. These nullable/defaulted additions let a
     # local database created by an earlier S02 draft move forward in place.

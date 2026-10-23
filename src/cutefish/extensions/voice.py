@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
+import math
 import os
 import uuid
 import wave
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
@@ -20,12 +23,15 @@ from cutefish.core.paths import HostPathResolver, PathPolicyError
 from cutefish.memory.service import OWNER_PERSON_ID
 from cutefish.qq.sender import ControlledRecordMedia
 from cutefish.qq.service import QqError
+from cutefish.local_audio.errors import LocalAudioError
 
 from .models import ManagedMediaRecord, VoiceApproval, VoiceProfileState, VoiceProfileVersion
 from .tts import SpeechError, TtsCapabilityProbe, _validate_wave
+from .voice_candidates import VOICE_ID_PREFIX, VoiceCandidateService
 
 
 VOICE_ENGINE_ID = "windows.system_speech"
+QWEN_ENGINE_ID = "qwen3.base"
 VOICE_PROFILE_ID = "local-sapi"
 VOICE_ARTIFACT_ROOT = "voice-artifacts"
 VOICE_ARTIFACT_PREFIX = f"{VOICE_ARTIFACT_ROOT}/"
@@ -59,12 +65,18 @@ class VoiceService:
         *,
         deployment_profile=None,
         qq_service=None,
+        voice_candidates: VoiceCandidateService | None = None,
+        qwen_tts_runtime=None,
+        local_audio_lane=None,
     ):
         self.session_factory = session_factory
         self.paths = paths
         self.tts = tts
         self.get_deployment_profile = deployment_profile or (lambda: "local_trial")
         self.qq_service = qq_service
+        self.voice_candidates = voice_candidates
+        self.qwen_tts_runtime = qwen_tts_runtime
+        self.local_audio_lane = local_audio_lane
 
     async def status(self) -> dict[str, Any]:
         async with self.session_factory() as session:
@@ -92,7 +104,11 @@ class VoiceService:
             and approval.profile_version == profile.version
             and approval.settings_hash == profile.settings_hash
             and profile.settings_hash == _profile_settings_hash(
-                profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                profile.engine_id,
+                profile.voice_id,
+                profile.voice_name,
+                profile.culture,
+                profile.engine_config_json,
             )
             and audition is not None
             and audition.asset_class == "generated_voice"
@@ -133,7 +149,10 @@ class VoiceService:
                 "voice_name": profile.voice_name,
                 "culture": profile.culture,
                 "settings_hash": profile.settings_hash,
-                "capability": "plain_reading",
+                "capability": "reference_conditioned_clone"
+                if profile.engine_id == QWEN_ENGINE_ID
+                else "plain_reading",
+                "engine_config": _safe_engine_config(profile.engine_config_json),
             }
         approval_data = None
         if approval_is_current and approval is not None:
@@ -146,7 +165,11 @@ class VoiceService:
             }
         return {
             "revision": revision,
-            "source_mode": "windows_sapi",
+            "source_mode": (
+                "qwen_voice_design"
+                if profile is not None and profile.engine_id == QWEN_ENGINE_ID
+                else "windows_sapi"
+            ),
             "deployment_profile": deployment_profile,
             "production_enabled": False,
             "runtime_enabled": runtime_enabled,
@@ -159,25 +182,35 @@ class VoiceService:
         }
 
     async def set_profile(self, *, expected_revision: int, voice_id: str, actor_id: str) -> dict[str, Any]:
-        voices = self.tts.inspect().get("voices", [])
-        voice = next(
-            (item for item in voices if isinstance(item, dict) and item.get("voice_id") == voice_id),
-            None,
+        engine_config_json = None
+        if isinstance(voice_id, str) and voice_id.startswith(VOICE_ID_PREFIX):
+            if self.voice_candidates is None:
+                raise VoiceError("qwen_runtime_unavailable", "本机声线候选服务当前不可用。", 409)
+            try:
+                binding = await self.voice_candidates.profile_binding(voice_id)
+            except SpeechError as exc:
+                raise VoiceError(exc.code, exc.message, exc.status_code) from exc
+            engine_id = QWEN_ENGINE_ID
+            voice_name = f"Qwen VoiceDesign {binding['candidate_id'][:8]}"
+            culture = "zh-CN"
+            engine_config_json = _canonical_json(binding)
+        else:
+            voices = self.tts.inspect().get("voices", [])
+            voice = next(
+                (item for item in voices if isinstance(item, dict) and item.get("voice_id") == voice_id),
+                None,
+            )
+            if voice is None:
+                raise VoiceError("voice_unavailable", "所选声线当前不可用；请先刷新本机声线列表。", 409)
+            voice_name, culture = voice.get("name"), voice.get("culture")
+            if not all(isinstance(value, str) and value.strip() for value in (voice_name, culture)):
+                raise VoiceError("voice_unavailable", "所选声线资料不完整，请刷新本机声线列表。", 409)
+            engine_id = VOICE_ENGINE_ID
+            voice_name = voice_name.strip()
+            culture = culture.strip()
+        settings_hash = _profile_settings_hash(
+            engine_id, voice_id, voice_name, culture, engine_config_json
         )
-        if voice is None:
-            raise VoiceError("voice_unavailable", "所选声线当前不可用；请先刷新本机声线列表。", 409)
-        voice_name, culture = voice.get("name"), voice.get("culture")
-        if not all(isinstance(value, str) and value.strip() for value in (voice_name, culture)):
-            raise VoiceError("voice_unavailable", "所选声线资料不完整，请刷新本机声线列表。", 409)
-        profile_data = {
-            "engine_id": VOICE_ENGINE_ID,
-            "voice_id": voice_id,
-            "voice_name": voice_name.strip(),
-            "culture": culture.strip(),
-        }
-        settings_hash = hashlib.sha256(
-            json.dumps(profile_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
         now = utc_now()
         async with self.session_factory() as session:
             async with session.begin():
@@ -195,10 +228,11 @@ class VoiceService:
                     VoiceProfileVersion(
                         profile_id=VOICE_PROFILE_ID,
                         version=profile_version,
-                        engine_id=VOICE_ENGINE_ID,
+                        engine_id=engine_id,
                         voice_id=voice_id,
-                        voice_name=voice_name.strip(),
-                        culture=culture.strip(),
+                        voice_name=voice_name,
+                        culture=culture,
+                        engine_config_json=engine_config_json,
                         settings_hash=settings_hash,
                         created_by=actor_id,
                         created_at=now,
@@ -291,12 +325,17 @@ class VoiceService:
         if not content or len(content) > 240:
             raise VoiceError("invalid_voice_preview_text", "试听文本必须为1到240个字符。")
         snapshot = await self._profile_snapshot(expected_profile_version)
-        try:
-            audio, _voice = await asyncio.to_thread(
-                self.tts.synthesize_preview, content, snapshot["voice_id"]
+        if snapshot["engine_id"] == QWEN_ENGINE_ID:
+            audio = await self._synthesize_qwen(
+                content, snapshot, max_text_chars=240
             )
-        except SpeechError as exc:
-            raise VoiceError(exc.code, exc.message, exc.status_code) from exc
+        else:
+            try:
+                audio, _voice = await asyncio.to_thread(
+                    self.tts.synthesize_preview, content, snapshot["voice_id"]
+                )
+            except SpeechError as exc:
+                raise VoiceError(exc.code, exc.message, exc.status_code) from exc
         duration_ms = self._validate_audio(audio, max_seconds=MAX_REPLY_SECONDS)
         artifact_id = str(uuid.uuid4())
         row = self._new_artifact(
@@ -359,7 +398,11 @@ class VoiceService:
                     or artifact.profile_version != profile.version
                     or artifact.profile_settings_hash != profile.settings_hash
                     or profile.settings_hash != _profile_settings_hash(
-                        profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                        profile.engine_id,
+                        profile.voice_id,
+                        profile.voice_name,
+                        profile.culture,
+                        profile.engine_config_json,
                     )
                 ):
                     raise VoiceError("voice_preview_unavailable", "试听产物与当前声线版本不匹配。", 409)
@@ -422,15 +465,20 @@ class VoiceService:
             expected_batch_version=expected_batch_version,
         )
         await self._validate_qq_guard(snapshot["guard"])
-        try:
-            audio, _voice = await asyncio.to_thread(
-                self.tts.synthesize_preview,
-                snapshot["content"],
-                snapshot["voice_id"],
-                max_text_chars=MAX_REPLY_CHARS,
+        if snapshot["engine_id"] == QWEN_ENGINE_ID:
+            audio = await self._synthesize_qwen(
+                snapshot["content"], snapshot, max_text_chars=MAX_REPLY_CHARS
             )
-        except SpeechError as exc:
-            raise VoiceError(exc.code, exc.message, exc.status_code) from exc
+        else:
+            try:
+                audio, _voice = await asyncio.to_thread(
+                    self.tts.synthesize_preview,
+                    snapshot["content"],
+                    snapshot["voice_id"],
+                    max_text_chars=MAX_REPLY_CHARS,
+                )
+            except SpeechError as exc:
+                raise VoiceError(exc.code, exc.message, exc.status_code) from exc
         duration_ms = self._validate_audio(audio, max_seconds=MAX_REPLY_SECONDS)
         artifact_id = str(uuid.uuid4())
         row = self._new_artifact(
@@ -690,15 +738,86 @@ class VoiceService:
             if profile is None:
                 raise VoiceError("voice_profile_not_found", "声线版本不存在。", 404)
             if profile.settings_hash != _profile_settings_hash(
-                profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                profile.engine_id,
+                profile.voice_id,
+                profile.voice_name,
+                profile.culture,
+                profile.engine_config_json,
             ):
                 raise VoiceError("voice_profile_integrity_error", "声线设置 hash 与当前 profile 字段不匹配。", 409)
+            if profile.engine_id == QWEN_ENGINE_ID and not _qwen_profile_binding_matches(
+                profile.voice_id, profile.engine_config_json
+            ):
+                raise VoiceError("voice_profile_integrity_error", "Qwen profile 的候选绑定不完整。", 409)
             return {
                 "profile_id": profile.profile_id,
                 "profile_version": profile.version,
+                "engine_id": profile.engine_id,
                 "voice_id": profile.voice_id,
                 "settings_hash": profile.settings_hash,
+                "engine_config_json": profile.engine_config_json,
             }
+
+    async def _synthesize_qwen(
+        self, text: str, snapshot: dict[str, Any], *, max_text_chars: int
+    ) -> bytes:
+        content = text.strip()
+        if not content or len(content) > max_text_chars:
+            raise VoiceError(
+                "invalid_voice_preview_text",
+                f"语音文本必须为1到{max_text_chars}个字符。",
+            )
+        if self.voice_candidates is None or self.qwen_tts_runtime is None or self.local_audio_lane is None:
+            raise VoiceError("qwen_runtime_unavailable", "本机 Qwen 语音 runtime 当前不可用。", 409)
+        binding = _safe_engine_config(snapshot.get("engine_config_json"))
+        if not isinstance(binding, dict) or not binding.get("candidate_id"):
+            raise VoiceError("voice_profile_integrity_error", "Qwen profile 缺少候选绑定。", 409)
+        try:
+            current_binding, reference_audio = await self.voice_candidates.profile_reference(binding)
+            base_snapshot = current_binding["base"]
+            runtime_binding = current_binding["runtime"]
+            async with self.local_audio_lane.job("tts") as job:
+                reference_path = Path(job.workspace) / "reference.wav"
+                with reference_path.open("xb") as stream:
+                    stream.write(reference_audio)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                verified_reference = reference_path.read_bytes()
+                if (
+                    hashlib.sha256(verified_reference).hexdigest()
+                    != current_binding["reference_sha256"]
+                ):
+                    raise VoiceError("qwen_reference_mismatch", "声线候选参考 WAV hash 不匹配。", 409)
+                result = await self.qwen_tts_runtime.synthesize_clone(
+                    job,
+                    text=content,
+                    reference_wav=verified_reference,
+                    reference_sha256=current_binding["reference_sha256"],
+                    reference_text=current_binding["reference_text"],
+                    expected_model_id=base_snapshot["model_id"],
+                    expected_model_revision=base_snapshot["revision"],
+                    expected_resource_fingerprint=base_snapshot["resource_fingerprint"],
+                    max_new_tokens=runtime_binding["generation"]["initial_max_new_tokens"],
+                    seed=current_binding["seed"],
+                )
+                _validate_qwen_base_result(result, current_binding)
+                audio = _read_qwen_preview_result(result, job.workspace)
+            return audio
+        except VoiceError:
+            raise
+        except SpeechError as exc:
+            raise VoiceError(exc.code, exc.message, exc.status_code) from exc
+        except LocalAudioError as exc:
+            raise VoiceError(exc.code, exc.message, exc.status_code) from exc
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            message = getattr(exc, "message", None)
+            status_code = getattr(exc, "status_code", None)
+            if isinstance(code, str) and code.startswith("qwen_"):
+                raise VoiceError(
+                    code, str(message or "本机 Qwen 语音处理失败。"), int(status_code or 409)
+                ) from exc
+            raise
 
     async def _is_profile_current(self, snapshot: dict[str, Any]) -> bool:
         async with self.session_factory() as session:
@@ -713,14 +832,22 @@ class VoiceService:
                 and state.active_profile_version == snapshot["profile_version"]
                 and profile.settings_hash == snapshot["settings_hash"]
                 and profile.settings_hash == _profile_settings_hash(
-                    profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                    profile.engine_id,
+                    profile.voice_id,
+                    profile.voice_name,
+                    profile.culture,
+                    profile.engine_config_json,
                 )
             )
 
     async def _validate_approval_in_session(self, session, profile, approval) -> None:
         if (
             profile.settings_hash != _profile_settings_hash(
-                profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                profile.engine_id,
+                profile.voice_id,
+                profile.voice_name,
+                profile.culture,
+                profile.engine_config_json,
             )
             or approval.profile_id != profile.profile_id
             or approval.profile_version != profile.version
@@ -802,6 +929,10 @@ class VoiceService:
         )
         if profile is None or approval is None:
             raise VoiceError("voice_approval_required", "当前声线版本尚未通过试听批准。", 409)
+        if profile.engine_id == QWEN_ENGINE_ID and not _qwen_profile_binding_matches(
+            profile.voice_id, profile.engine_config_json
+        ):
+            raise VoiceError("voice_profile_integrity_error", "Qwen profile 的候选绑定不完整。", 409)
         await self._validate_approval_in_session(session, profile, approval)
 
         conversation = await session.get(Conversation, conversation_id)
@@ -887,6 +1018,8 @@ class VoiceService:
                 "batch_id": conversation.batch_id,
             },
             "voice_id": profile.voice_id,
+            "engine_id": profile.engine_id,
+            "engine_config_json": profile.engine_config_json,
         }
 
     async def _validate_reply_artifact_in_session(
@@ -941,7 +1074,11 @@ class VoiceService:
             or approval is None
             or profile.settings_hash != artifact.profile_settings_hash
             or profile.settings_hash != _profile_settings_hash(
-                profile.engine_id, profile.voice_id, profile.voice_name, profile.culture
+                profile.engine_id,
+                profile.voice_id,
+                profile.voice_name,
+                profile.culture,
+                profile.engine_config_json,
             )
             or approval.profile_id != profile.profile_id
             or approval.profile_version != profile.version
@@ -1246,16 +1383,153 @@ def _is_single_action_batch(value: Any) -> bool:
     )
 
 
-def _profile_settings_hash(engine_id: str, voice_id: str, voice_name: str, culture: str) -> str:
+def _profile_settings_hash(
+    engine_id: str,
+    voice_id: str,
+    voice_name: str,
+    culture: str,
+    engine_config_json: str | None = None,
+) -> str:
     profile_data = {
         "engine_id": engine_id,
         "voice_id": voice_id,
         "voice_name": voice_name,
         "culture": culture,
     }
+    if engine_config_json is not None:
+        try:
+            profile_data["engine_config_json"] = json.loads(engine_config_json)
+        except (TypeError, json.JSONDecodeError):
+            profile_data["engine_config_json"] = {"invalid": str(engine_config_json)}
     return hashlib.sha256(
         json.dumps(profile_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _canonical_json(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _safe_engine_config(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _qwen_profile_binding_matches(voice_id: str, engine_config_json: str | None) -> bool:
+    binding = _safe_engine_config(engine_config_json)
+    candidate_id = binding.get("candidate_id") if isinstance(binding, dict) else None
+    return isinstance(candidate_id, str) and voice_id == f"{VOICE_ID_PREFIX}{candidate_id}"
+
+
+def _read_qwen_preview_result(result: Any, workspace: Path) -> bytes:
+    raw_path = _qwen_result_value(result, "wav_path")
+    if raw_path is None:
+        raise VoiceError("qwen_output_invalid", "Qwen Base worker 没有返回 WAV 文件。", 502)
+    try:
+        workspace_path = Path(workspace).resolve(strict=True)
+        output_path = Path(raw_path).resolve(strict=True)
+        output_path.relative_to(workspace_path)
+        before = output_path.stat()
+        if not output_path.is_file() or not 0 < before.st_size <= MAX_VOICE_ARTIFACT_BYTES:
+            raise VoiceError("qwen_output_invalid", "Qwen Base WAV 超过8 MiB或为空。", 502)
+        with output_path.open("rb") as stream:
+            audio = stream.read(MAX_VOICE_ARTIFACT_BYTES + 1)
+        after = output_path.stat()
+    except VoiceError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise VoiceError("qwen_output_invalid", "Qwen Base WAV 未保留在当前临时工作区。", 502) from exc
+    if len(audio) != before.st_size or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        raise VoiceError("qwen_output_invalid", "Qwen Base WAV 在校验期间发生变化。", 502)
+    duration_ms = VoiceService._validate_audio(audio, max_seconds=MAX_REPLY_SECONDS)
+    reported_size = _qwen_result_value(result, "byte_length")
+    reported_hash = _qwen_result_value(result, "sha256")
+    reported_duration = _qwen_result_value(result, "duration_seconds")
+    reported_rate = _qwen_result_value(result, "sample_rate")
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            sample_rate = wav.getframerate()
+    except (wave.Error, EOFError, OSError) as exc:
+        raise VoiceError("qwen_output_invalid", "Qwen Base WAV 头无效。", 502) from exc
+    if (
+        reported_size != len(audio)
+        or reported_hash != hashlib.sha256(audio).hexdigest()
+        or not isinstance(reported_duration, (int, float))
+        or abs(float(reported_duration) - duration_ms / 1000) > 0.002
+        or reported_rate != sample_rate
+    ):
+        raise VoiceError("qwen_output_invalid", "Qwen Base WAV 与 worker 返回的元数据不匹配。", 502)
+    return audio
+
+
+def _validate_qwen_base_result(result: Any, binding: dict[str, Any]) -> None:
+    base = binding.get("base")
+    runtime = binding.get("runtime")
+    generation = runtime.get("generation") if isinstance(runtime, dict) else None
+    if not isinstance(base, dict) or not isinstance(generation, dict):
+        raise VoiceError("voice_profile_integrity_error", "Qwen profile 缺少 Base 运行绑定。", 409)
+    if any(
+        _qwen_result_value(result, result_key) != base.get(binding_key)
+        for result_key, binding_key in (
+            ("model_id", "model_id"),
+            ("model_revision", "revision"),
+            ("resource_fingerprint", "resource_fingerprint"),
+        )
+    ):
+        raise VoiceError("qwen_resource_mismatch", "Qwen Base 返回的模型信息与 profile 绑定不一致。", 409)
+
+    settings = _qwen_result_value(result, "settings")
+    retried = settings.get("retry_after_cuda_oom") if isinstance(settings, dict) else None
+    initial_tokens = generation.get("initial_max_new_tokens")
+    retry_tokens = generation.get("oom_retry_max_new_tokens")
+    expected_tokens = retry_tokens if retried is True else initial_tokens
+    expected_settings = {
+        "device": runtime.get("device"),
+        "dtype": runtime.get("dtype"),
+        "attn_implementation": runtime.get("attn_implementation"),
+        "trust_remote_code": runtime.get("trust_remote_code"),
+        "local_files_only": runtime.get("downloads_enabled") is False,
+        "seed": binding.get("seed"),
+        "initial_max_new_tokens": initial_tokens,
+        "max_new_tokens": expected_tokens,
+        "attempt_count": 2 if retried is True else 1,
+        "retry_policy": generation.get("oom_retry_policy"),
+        "language": "Chinese",
+        "retry_after_cuda_oom": retried,
+    }
+    if (
+        not isinstance(settings, dict)
+        or type(retried) is not bool
+        or any(settings.get(key) != value for key, value in expected_settings.items())
+        or type(settings.get("seed")) is not int
+        or type(settings.get("initial_max_new_tokens")) is not int
+        or type(settings.get("max_new_tokens")) is not int
+        or type(settings.get("attempt_count")) is not int
+    ):
+        raise VoiceError("qwen_worker_failed", "Qwen Base 实际生成设置与 profile 绑定策略不一致。", 502)
+
+    byte_length = _qwen_result_value(result, "byte_length")
+    duration = _qwen_result_value(result, "duration_seconds")
+    if (
+        type(byte_length) is not int
+        or not 0 < byte_length <= generation.get("max_output_bytes", 0)
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or not 0 < duration <= generation.get("max_output_seconds", 0)
+    ):
+        raise VoiceError("qwen_output_invalid", "Qwen Base 输出超出 profile 绑定的大小或时长上限。", 502)
+
+
+def _qwen_result_value(result: Any, key: str):
+    if isinstance(result, dict):
+        return result.get(key)
+    return getattr(result, key, None)
 
 
 def _should_cancel_artifact(exc: VoiceError) -> bool:

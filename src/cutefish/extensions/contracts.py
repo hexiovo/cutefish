@@ -142,6 +142,22 @@ class TtsPreviewRequest(RequestModel):
         return self
 
 
+class VoiceCandidateCreate(RequestModel):
+    """Create one locally generated, unapproved VoiceDesign reference."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: StrictStr = Field(min_length=1, max_length=160)
+    style_prompt: StrictStr = Field(min_length=1, max_length=500)
+    seed: StrictInt = Field(ge=0, le=4_294_967_295)
+
+    @model_validator(mode="after")
+    def require_nonblank_inputs(self):
+        if not self.text.strip() or not self.style_prompt.strip():
+            raise ValueError("参考文本和风格提示不能为空")
+        return self
+
+
 class VoiceProfilePut(RequestModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

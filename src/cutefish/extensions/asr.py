@@ -1,15 +1,15 @@
-"""On-demand, local-only faster-whisper transcription for approved Room WAVs."""
+"""On-demand local ASR for approved Room media and transient owner uploads."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
-import os
-import subprocess
+import math
 import sys
-import tempfile
 import wave
+from collections.abc import AsyncIterable
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +24,38 @@ from .tts import SpeechError, _validate_wave
 MAX_ASR_BYTES = 64 * 1024 * 1024
 MAX_ASR_SECONDS = 120
 MAX_ASR_WORKER_SECONDS = 300
-ASR_MODEL_IDS = ("base", "small")
+ASR_MODEL_IDS = ("small",)
+ASR_ACCEPTED_FORMATS = ("wav", "mp3", "m4a", "ogg", "flac")
+ASR_ACCEPTED_CONTENT_TYPES = frozenset(
+    {
+        "application/octet-stream",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/x-m4a",
+        "audio/ogg",
+        "audio/flac",
+        "audio/x-flac",
+    }
+)
 
 
 class AsrService:
-    def __init__(self, paths: HostPathResolver, rooms: RoomService, tasks: TaskService, chat_service=None):
+    def __init__(
+        self,
+        paths: HostPathResolver,
+        rooms: RoomService,
+        tasks: TaskService,
+        chat_service=None,
+        local_audio_lane=None,
+    ):
         self.paths = paths
         self.rooms = rooms
         self.tasks = tasks
         self.chat_service = chat_service
+        self.local_audio_lane = local_audio_lane
 
     def capabilities(self) -> dict[str, Any]:
         try:
@@ -52,14 +75,14 @@ class AsrService:
         available_model = next((item["model_id"] for item in models if item["installed"]), None)
         runtime_available = installed_version is not None and available_model is not None
         if runtime_available:
-            status = "partial"
-            detail = "本机存在可用的 faster-whisper CPU int8 模型；试听、ChatService 与 QQ 语音回复仍需分别核验和批准。"
+            status = "ready"
+            detail = "本机离线 small ASR 运行时与模型资源可用（CPU/int8）；转写不会自动提交聊天或发送语音。"
         elif installed_version is None:
             status = "needs_resource"
-            detail = "faster-whisper 未安装；未导入、下载、安装或联网。"
+            detail = "项目 venv 尚无 faster-whisper；不会自动安装或联网回退。"
         else:
             status = "needs_resource"
-            detail = "未发现 model_root/faster-whisper/base 或 small 本地模型；未下载模型。"
+            detail = "model_root/faster-whisper/small 本地模型尚不可用；不会自动下载或联网回退。"
         return {
             "status": status,
             "engine_id": "faster-whisper",
@@ -67,11 +90,11 @@ class AsrService:
             "runtime_available": runtime_available,
             "model_candidates": models,
             "selected_model_id": available_model,
+            "accepted_formats": list(ASR_ACCEPTED_FORMATS),
             "device": "cpu",
             "compute_type": "int8",
             "max_duration_seconds": MAX_ASR_SECONDS,
             "max_bytes": MAX_ASR_BYTES,
-            "accepted_formats": ["audio/wav"],
             "chat_service": "not_started",
             "voice_reply": "not_approved",
             "qq_outbox": "not_started",
@@ -159,7 +182,33 @@ class AsrService:
         model_path = self._model_path(model_id)
         if model_path is None:
             raise SpeechError("asr_model_unavailable", "ASR 本地模型在处理前已不可用。", 409)
-        transcript, language = await self._run_worker(audio, model_path)
+        from cutefish.local_audio import (
+            LocalAudioBusy,
+            LocalAudioTimeout,
+            LocalAudioUnavailable,
+            LocalAudioWorkerStartError,
+        )
+
+        if self.local_audio_lane is None:
+            raise SpeechError("local_audio_unavailable", "本机语音处理通道尚未接入。", 503)
+        try:
+            # Room media and raw uploads share the same non-waiting lane so an
+            # ASR request cannot overlap a TTS worker or another ASR worker.
+            async with self.local_audio_lane.job("asr") as job:
+                audio_path = job.workspace / "input.audio"
+                try:
+                    await asyncio.to_thread(audio_path.write_bytes, audio)
+                except OSError as exc:
+                    raise SpeechError("temp_root_unavailable", "本机 ASR 临时目录当前不可写。", 503) from exc
+                worker_result = await self._run_worker(job, audio_path, model_path)
+        except LocalAudioBusy as exc:
+            raise SpeechError("asr_busy", "本机语音处理通道正忙，请稍后重试。", 409) from exc
+        except LocalAudioTimeout as exc:
+            raise SpeechError("asr_worker_timeout", "本地 ASR 超过五分钟时限，操作已停止。", 504) from exc
+        except LocalAudioUnavailable as exc:
+            raise SpeechError("local_audio_unavailable", "本机语音临时工作区当前不可用。", 503) from exc
+        except LocalAudioWorkerStartError as exc:
+            raise SpeechError("asr_worker_unavailable", "本地 ASR worker 当前不可用。", 503) from exc
         if task_id is not None:
             await self._assert_task_current(task_id, expected_task_revision)
         latest_item = await self.rooms.get(room_item_id)
@@ -167,13 +216,16 @@ class AsrService:
             raise RoomError("room_version_conflict", "音频条目在识别期间发生变化；本次结果已丢弃。", 409)
         result = {
             "status": "transcribed",
-            "transcript": transcript,
-            "language": language,
+            "transcript": worker_result["text"],
+            "language": worker_result["language"],
+            "duration_seconds": worker_result["duration_seconds"],
+            "segments": worker_result["segments"],
             "source": {
+                "kind": "room_media",
                 "room_item_id": room_item_id,
                 "room_version": expected_room_version,
-                "media_type": content["media_type"],
-                "duration_seconds": round(duration, 3),
+                "media_type": worker_result["media_type"],
+                "duration_seconds": worker_result["duration_seconds"],
                 "byte_length": len(audio),
                 "content_hash": content["content_hash"],
             },
@@ -185,16 +237,119 @@ class AsrService:
             "detail": "识别结果尚未发送给 ChatService、合成语音或加入 QQ Outbox。",
         }
         if submit_to_chat:
+            if not worker_result["text"].strip():
+                raise SpeechError("empty_transcription", "识别结果为空，没有提交到 ChatService。", 422)
             chat_request = await self._submit_to_chat(
                 conversation_id=conversation_id,
                 expected_revision=expected_conversation_revision,
                 idempotency_key=chat_idempotency_key,
-                transcript=transcript,
+                transcript=worker_result["text"],
             )
             result["downstream"]["chat_service"] = "submitted"
             result["chat_request"] = chat_request
             result["detail"] = "识别文本已按明确请求提交到 ChatService；本操作没有合成或发送语音，也没有启动 QQ Outbox。"
         return result
+
+    async def transcribe_upload(
+        self,
+        chunks: AsyncIterable[bytes],
+        *,
+        content_type: str | None,
+        content_length: str | None = None,
+    ) -> dict[str, Any]:
+        """Transcribe one explicitly submitted raw audio body in a private workspace."""
+        normalized_content_type = (content_type or "").split(";", maxsplit=1)[0].strip().casefold()
+        if normalized_content_type not in ASR_ACCEPTED_CONTENT_TYPES:
+            raise SpeechError(
+                "unsupported_audio_format",
+                "上传必须是本机音频原始字节流；支持 WAV、MP3、M4A、OGG 或 FLAC。",
+                422,
+            )
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise SpeechError("invalid_content_length", "音频上传长度标头无效。", 400) from exc
+            if declared_length < 0:
+                raise SpeechError("invalid_content_length", "音频上传长度标头无效。", 400)
+            if declared_length > MAX_ASR_BYTES:
+                raise SpeechError("audio_too_large", "音频超过64 MiB上限。", 413)
+
+        capabilities = self.capabilities()
+        if not capabilities["runtime_available"]:
+            raise SpeechError("asr_model_unavailable", capabilities["detail"], 409)
+        model_id = str(capabilities["selected_model_id"])
+        model_path = self._model_path(model_id)
+        if model_path is None:
+            raise SpeechError("asr_model_unavailable", "ASR 本地模型在处理前已不可用。", 409)
+
+        from cutefish.local_audio import (
+            LocalAudioBusy,
+            LocalAudioTimeout,
+            LocalAudioUnavailable,
+            LocalAudioWorkerStartError,
+        )
+
+        if self.local_audio_lane is None:
+            raise SpeechError("local_audio_unavailable", "本机语音处理通道尚未接入。", 503)
+        try:
+            # Reserve the shared non-waiting lane before receiving the body. A busy
+            # ASR/TTS request therefore fails without buffering private audio.
+            async with self.local_audio_lane.job("asr") as job:
+                input_path = job.workspace / "input.audio"
+                content_hash, byte_length = await self._stream_upload(chunks, input_path)
+                worker_result = await self._run_worker(job, input_path, model_path)
+        except LocalAudioBusy as exc:
+            raise SpeechError("asr_busy", "本机语音处理通道正忙，请稍后重试。", 409) from exc
+        except LocalAudioTimeout as exc:
+            raise SpeechError("asr_worker_timeout", "本地 ASR 超过五分钟时限，操作已停止。", 504) from exc
+        except LocalAudioUnavailable as exc:
+            raise SpeechError("local_audio_unavailable", "本机语音临时工作区当前不可用。", 503) from exc
+        except LocalAudioWorkerStartError as exc:
+            raise SpeechError("asr_worker_unavailable", "本地 ASR worker 当前不可用。", 503) from exc
+
+        return {
+            "status": "transcribed",
+            "transcript": worker_result["text"],
+            "language": worker_result["language"],
+            "duration_seconds": worker_result["duration_seconds"],
+            "segments": worker_result["segments"],
+            "source": {
+                "kind": "owner_upload",
+                "media_type": worker_result["media_type"],
+                "byte_length": byte_length,
+                "content_hash": content_hash,
+            },
+            "downstream": {
+                "chat_service": "not_started",
+                "voice_reply": "not_approved",
+                "qq_outbox": "not_started",
+            },
+            "detail": "上传音频已在本机离线转写；没有提交 ChatService、合成语音或启动 QQ Outbox。",
+        }
+
+    async def _stream_upload(self, chunks: AsyncIterable[bytes], path: Path) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        total_bytes = 0
+        try:
+            with path.open("xb") as output:
+                async for chunk in chunks:
+                    if not isinstance(chunk, bytes):
+                        raise SpeechError("invalid_audio_payload", "音频上传数据无效。", 422)
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_ASR_BYTES:
+                        raise SpeechError("audio_too_large", "音频超过64 MiB上限。", 413)
+                    digest.update(chunk)
+                    output.write(chunk)
+        except SpeechError:
+            raise
+        except OSError as exc:
+            raise SpeechError("temp_root_unavailable", "本机 ASR 临时目录当前不可写。", 503) from exc
+        if total_bytes == 0:
+            raise SpeechError("invalid_audio_payload", "上传音频为空。", 422)
+        return digest.hexdigest(), total_bytes
 
     async def _assert_conversation_current(self, conversation_id: str | None, expected_revision: int | None) -> None:
         if self.chat_service is None:
@@ -257,27 +412,10 @@ class AsrService:
         required = (path / "model.bin", path / "config.json")
         return path if path.is_dir() and all(item.is_file() for item in required) else None
 
-    async def _run_worker(self, audio: bytes, model_path: Path) -> tuple[str, str | None]:
+    async def _run_worker(self, job, audio_path: Path, model_path: Path) -> dict[str, Any]:
         try:
-            worker_root = self.paths.resolve("temp_root", "extensions/asr-worker", for_write=True)
-            worker_root.mkdir(parents=True, exist_ok=True)
-        except (PathPolicyError, OSError) as exc:
-            raise SpeechError("temp_root_unavailable", "本机 ASR 临时目录当前不可写。", 409) from exc
-
-        try:
-            with tempfile.TemporaryDirectory(prefix="transcribe-", dir=worker_root) as temp_dir:
-                audio_path = Path(temp_dir) / "input.wav"
-                audio_path.write_bytes(audio)
-                env = os.environ.copy()
-                env.update(
-                    {
-                        "HF_HUB_OFFLINE": "1",
-                        "TRANSFORMERS_OFFLINE": "1",
-                        "HF_DATASETS_OFFLINE": "1",
-                    }
-                )
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                process = await asyncio.create_subprocess_exec(
+            completed = await job.run(
+                [
                     sys.executable,
                     "-X",
                     "utf8",
@@ -288,35 +426,87 @@ class AsrService:
                     str(model_path),
                     "--audio-path",
                     str(audio_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    creationflags=creationflags,
-                )
-                try:
-                    stdout, _stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=MAX_ASR_WORKER_SECONDS
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    process.kill()
-                    await process.wait()
-                    raise
-                if process.returncode != 0:
-                    raise SpeechError("asr_worker_failed", "本地 ASR worker 失败；没有启用网络或下载回退。", 503)
-                try:
-                    result = json.loads(stdout.decode("utf-8"))
-                    transcript = result["text"]
-                    language = result.get("language")
-                except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-                    raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效结果。", 503) from exc
-                if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > 12_000:
-                    raise SpeechError("asr_result_invalid", "识别文本为空或超出长度限制。", 503)
-                return transcript, language if isinstance(language, str) else None
-        except asyncio.TimeoutError as exc:
-            raise SpeechError("asr_worker_timeout", "本地 ASR 超过五分钟时限，操作已停止。", 504) from exc
+                    "--workspace",
+                    str(job.workspace),
+                    "--max-seconds",
+                    str(MAX_ASR_SECONDS),
+                ],
+                timeout_seconds=MAX_ASR_WORKER_SECONDS,
+            )
         except asyncio.CancelledError:
             raise
         except SpeechError:
             raise
         except OSError as exc:
             raise SpeechError("asr_worker_unavailable", "本地 ASR worker 当前不可用。", 503) from exc
+
+        try:
+            result = json.loads(completed.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if completed.returncode != 0:
+                raise SpeechError("asr_worker_failed", "本地 ASR worker 失败；没有启用网络或下载回退。", 503) from exc
+            raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效结果。", 503) from exc
+        if not isinstance(result, dict):
+            raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效结果。", 503)
+        error = result.get("error")
+        if completed.returncode != 0:
+            error_map = {
+                "invalid_audio_container": ("invalid_audio_container", "音频容器无效或不受支持。", 422),
+                "unsupported_audio_format": ("unsupported_audio_format", "音频编码不受支持。支持 WAV、MP3、M4A、OGG 或 FLAC。", 422),
+                "audio_too_long": ("audio_too_long", "音频超过120秒上限。", 422),
+                "invalid_audio": ("invalid_audio", "音频无法解码或没有可识别的音轨。", 422),
+            }
+            details = error_map.get(error)
+            if details is not None:
+                raise SpeechError(*details)
+            raise SpeechError("asr_worker_failed", "本地 ASR worker 失败；没有启用网络或下载回退。", 503)
+
+        transcript = result.get("text")
+        language = result.get("language")
+        duration = result.get("duration_seconds")
+        media_type = result.get("media_type")
+        segments = result.get("segments")
+        if (
+            not isinstance(transcript, str)
+            or len(transcript) > 12_000
+            or (
+                language is not None
+                and (not isinstance(language, str) or len(language) > 32)
+            )
+            or not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or not math.isfinite(float(duration))
+            or duration <= 0
+            or duration > MAX_ASR_SECONDS
+            or media_type not in {"audio/wav", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/flac"}
+            or not isinstance(segments, list)
+            or len(segments) > 2_000
+        ):
+            raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效结果。", 503)
+        normalized_segments: list[dict[str, Any]] = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效分段。", 503)
+            start, end, text = segment.get("start"), segment.get("end"), segment.get("text")
+            if (
+                not isinstance(start, (int, float))
+                or not isinstance(end, (int, float))
+                or isinstance(start, bool)
+                or isinstance(end, bool)
+                or not math.isfinite(float(start))
+                or not math.isfinite(float(end))
+                or start < 0
+                or end < start
+                or end > duration + 0.25
+                or not isinstance(text, str)
+                or len(text) > 4_000
+            ):
+                raise SpeechError("asr_worker_invalid_result", "本地 ASR worker 返回了无效分段。", 503)
+            normalized_segments.append({"start": float(start), "end": float(end), "text": text})
+        return {
+            "text": transcript.strip(),
+            "language": language,
+            "duration_seconds": round(float(duration), 3),
+            "media_type": media_type,
+            "segments": normalized_segments,
+        }

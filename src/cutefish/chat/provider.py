@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import base64
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from openai import AsyncOpenAI
 
@@ -32,6 +33,11 @@ INPUT_HIT_CNY_PER_MILLION = Decimal("0.04")
 OUTPUT_CNY_PER_MILLION = Decimal("8")
 RESERVATION_INPUT_TOKENS = DEEPSEEK_CONTEXT_WINDOW
 RESERVATION_OUTPUT_TOKENS = DEEPSEEK_OUTPUT_TOKEN_CAP
+MAX_INLINE_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_PROVIDER_REQUEST_BYTES = 48 * 1024 * 1024
+MAX_IMAGE_EDGE = 8192
+IMAGE_DETAIL_LEVELS = frozenset({"low", "high", "original", "auto"})
+IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg"})
 
 
 class ProviderError(Exception):
@@ -121,6 +127,70 @@ class ProviderResult:
     usage: ProviderUsage
 
 
+class TextContentPart(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class ImageURLPayload(TypedDict):
+    url: str
+    detail: Literal["low", "high", "original", "auto"]
+
+
+class ImageContentPart(TypedDict):
+    type: Literal["image_url"]
+    image_url: ImageURLPayload
+
+
+class UserImageMessage(TypedDict):
+    role: Literal["user"]
+    content: list[TextContentPart | ImageContentPart]
+
+
+@dataclass(frozen=True, slots=True)
+class DeepSeekVisionRequest:
+    prompt: str
+    image_bytes: bytes
+    mime_type: Literal["image/png", "image/jpeg"]
+    detail: Literal["low", "high", "original", "auto"] = "low"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prompt, str) or not self.prompt.strip() or len(self.prompt) > 4000:
+            raise ProviderError("invalid_vision_prompt", "视觉请求提示不能为空且最多4000个字符。", uncertain=False)
+        if type(self.image_bytes) is not bytes or not 1 <= len(self.image_bytes) <= MAX_INLINE_IMAGE_BYTES:
+            raise ProviderError("image_size_limit", "内联图像必须为非空且不超过32 MiB。", uncertain=False)
+        if self.mime_type not in IMAGE_MIME_TYPES:
+            raise ProviderError("unsupported_image_type", "视觉请求只支持 PNG 或 JPEG 图像。", uncertain=False)
+        if self.detail not in IMAGE_DETAIL_LEVELS:
+            raise ProviderError("invalid_image_detail", "图像细节档位无效。", uncertain=False)
+
+    @property
+    def request_bytes_upper_bound(self) -> int:
+        # Includes the base64 expansion, UTF-8 prompt and conservative JSON framing.
+        return 4 * ((len(self.image_bytes) + 2) // 3) + len(self.prompt.encode("utf-8")) + 512
+
+    def to_message(self) -> UserImageMessage:
+        encoded = base64.b64encode(self.image_bytes).decode("ascii")
+        data_url = f"data:{self.mime_type};base64,{encoded}"
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": self.prompt},
+                {"type": "image_url", "image_url": {"url": data_url, "detail": self.detail}},
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DeepSeekVisionResult:
+    provider_response_id: str
+    configured_model: str
+    returned_model: str
+    observation: str
+    finish_reason: str | None
+    usage: ProviderUsage
+
+
 class DeepSeekAdapter:
     """One-shot, non-streaming calls. Retries, tool loops, and auto-continuation are disabled."""
 
@@ -136,6 +206,35 @@ class DeepSeekAdapter:
         return self.config.fingerprint()
 
     async def complete(self, *, api_key: str | None, messages: list[dict[str, str]]) -> ProviderResult:
+        return await self._complete_messages(api_key=api_key, messages=messages)
+
+    async def observe_image(
+        self,
+        *,
+        api_key: str | None,
+        request: DeepSeekVisionRequest,
+    ) -> DeepSeekVisionResult:
+        if request.request_bytes_upper_bound > MAX_PROVIDER_REQUEST_BYTES:
+            raise ProviderError("request_size_limit", "视觉请求体超过48 MiB上限。", uncertain=False)
+        message = request.to_message()
+        body_bytes = len(json.dumps([message], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if body_bytes > MAX_PROVIDER_REQUEST_BYTES:
+            raise ProviderError("request_size_limit", "视觉请求体超过48 MiB上限。", uncertain=False)
+        result = await self._complete_messages(api_key=api_key, messages=[message])
+        if result.returned_model != self.config.model:
+            raise ProviderError("provider_model_mismatch", "视觉响应模型与请求配置不一致。")
+        if not result.text.strip():
+            raise ProviderError("provider_observation_empty", "视觉响应没有可核验的观察文本。")
+        return DeepSeekVisionResult(
+            provider_response_id=result.provider_response_id,
+            configured_model=result.configured_model,
+            returned_model=result.returned_model,
+            observation=result.text,
+            finish_reason=result.finish_reason,
+            usage=result.usage,
+        )
+
+    async def _complete_messages(self, *, api_key: str | None, messages: list[dict[str, Any]]) -> ProviderResult:
         if not api_key:
             raise NeedsCredentials()
         try:
@@ -188,7 +287,7 @@ def _usage_from_response(usage: Any) -> ProviderUsage | None:
         return None
     prompt_tokens = getattr(usage, "prompt_tokens", None)
     completion_tokens = getattr(usage, "completion_tokens", None)
-    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+    if type(prompt_tokens) is not int or type(completion_tokens) is not int:
         return None
     if prompt_tokens < 0 or completion_tokens < 0:
         return None
@@ -197,7 +296,7 @@ def _usage_from_response(usage: Any) -> ProviderUsage | None:
     if hit is None and details is not None:
         hit = getattr(details, "cached_tokens", None)
     miss = getattr(usage, "prompt_cache_miss_tokens", None)
-    if not isinstance(hit, int) or not isinstance(miss, int):
+    if type(hit) is not int or type(miss) is not int:
         hit = None
         miss = None
     if hit is not None and (hit < 0 or miss < 0 or hit + miss != prompt_tokens):

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "resource_id": "deepseek-v4-tokenizer",
+  "file": {
+    "path": "deepseek-v4-tokenizer/tokenizer.json",
+    "format": "tokenizer.json",
+    "bytes": 6367096,
+    "sha256": "89085f12ef79460ac5f66d1119325ddfc694b4ab209d80bbd81d35f081dc9614"
+  },
+  "source": {
+    "url": "https://cdn.deepseek.com/api-docs/deepseek_v4_tokenizer.zip",
+    "archive_filename": "deepseek-v4-tokenizer-source-20261023.zip",
+    "archive_bytes": 1911504,
+    "archive_sha256": "e7310d1dafe0a86d8a5629fe78a7c763760f651db9b8682718a1781dcd6fe495",
+    "fetched_at_utc": "2026-10-23T11:55:44Z",
+    "version_status": "unversioned",
+    "official_checksum": null
+  },
+  "tokenizer": {
+    "library": "tokenizers",
+    "locked_version": "0.23.3",
+    "json_version": "1.0",
+    "model_type": "BPE",
+    "vocab_size": 128000,
+    "merges_count": 127741
+  }
+}

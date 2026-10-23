@@ -33,7 +33,7 @@ def register_module(registry: ModuleRegistry) -> ModuleSpec:
                 name="视觉模型观察",
                 side_effect=SideEffect.NONE,
                 status="needs_verification",
-                reason="视觉模型及其费用尚未核实；目前不会调用模型。",
+                reason="DeepSeek typed adapter 与保守费用预留已接线；真实视觉模型能力及图像计价仍待验证。",
             ),
         ],
         runtime_state=ModuleRuntimeState.LAZY_IDLE,

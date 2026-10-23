@@ -3,17 +3,22 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NInput, NPopconfirm, NSelect, NTag } from 'naive-ui'
 import { ApiRequestError, api } from '../api/client'
 import { errorMessage } from '../api/errors'
-import type { AsrCapabilities, AsrTranscriptionResult, ChatConversation, ChatMessage, ChatTurnResult, OutboxItem, RoomItem, TtsCapabilities, TrialBatch, VoiceArtifact, VoiceOutboxAuthorizationResult, VoiceProfileData } from '../api/types'
+import type { AsrCapabilities, AsrTranscriptionResult, AsrUploadTranscriptionResult, ChatConversation, ChatMessage, ChatTurnResult, LocalVoiceCandidate, OutboxItem, RoomItem, TtsCapabilities, TrialBatch, VoiceArtifact, VoiceOutboxAuthorizationResult, VoiceProfileData } from '../api/types'
 import AppIcon from '../components/AppIcon.vue'
 import StatusPill from '../components/StatusPill.vue'
+import { appState } from '../stores/app'
 
 const tts = ref<TtsCapabilities | null>(null)
+const localVoiceCandidates = ref<LocalVoiceCandidate[]>([])
 const asr = ref<AsrCapabilities | null>(null)
 const voicesLoading = ref(false)
 const voiceProfileLoading = ref(false)
 const savingVoiceProfile = ref(false)
 const savingVoiceSettings = ref(false)
 const approvingVoice = ref(false)
+const candidatesLoading = ref(false)
+const candidateGenerating = ref(false)
+const candidateAudioLoadingId = ref('')
 const asrLoading = ref(false)
 const previewing = ref(false)
 const loadingRooms = ref(false)
@@ -21,6 +26,14 @@ const transcribing = ref(false)
 const error = ref('')
 const notice = ref('')
 const sampleText = ref('你好呀，我想用本机语音试听一小段。')
+const candidateText = ref('今天有一点小开心，想和你分享这件刚发生的事。')
+const candidateStylePrompt = ref('温柔、自然、亲近，普通话清晰，避免夸张；保持像家人聊天一样真诚。')
+const candidateSeed = ref('20261023')
+const candidateError = ref('')
+const candidateNotice = ref('')
+const candidateGenerationUncertain = ref(false)
+const candidateAudioId = ref('')
+const candidateAudioUrl = ref('')
 const selectedVoiceId = ref('')
 const voiceProfile = ref<VoiceProfileData | null>(null)
 const approvalPreview = ref<VoiceArtifact | null>(null)
@@ -52,7 +65,11 @@ const stoppingVoiceBatch = ref(false)
 const generatingVoiceReply = ref(false)
 const roomItems = ref<RoomItem[]>([])
 const selectedRoomItemId = ref('')
-const transcription = ref<AsrTranscriptionResult | null>(null)
+const selectedAsrFile = ref<File | null>(null)
+const asrUploadError = ref('')
+const asrUploadNotice = ref('')
+const asrUploadController = ref<AbortController | null>(null)
+const transcription = ref<AsrTranscriptionResult | AsrUploadTranscriptionResult | null>(null)
 const conversations = ref<ChatConversation[]>([])
 const ownerPersonId = ref('')
 const selectedConversationId = ref('')
@@ -73,10 +90,102 @@ interface VoiceReplyBinding {
   recipient_id: string
 }
 
-const voiceOptions = computed(() => (tts.value?.voices ?? []).map((voice) => ({
-  label: `${voice.name} · ${voice.culture}`,
-  value: voice.voice_id,
-})))
+const voiceOptions = computed(() => {
+  const options = (tts.value?.voices ?? []).map((voice) => ({
+    label: `${voice.name} · ${voice.culture}`,
+    value: voice.voice_id,
+  }))
+  const knownVoiceIds = new Set(options.map((option) => option.value))
+  for (const candidate of localVoiceCandidates.value) {
+    if (!knownVoiceIds.has(candidate.voice_id)) {
+      options.push({ label: `Qwen3 本机候选（未批准） · ${candidate.candidate_id}`, value: candidate.voice_id })
+      knownVoiceIds.add(candidate.voice_id)
+    }
+  }
+  return options
+})
+const isOwner = computed(() => appState.authenticated && appState.principal?.role === 'owner')
+const qwenTts = computed(() => tts.value?.qwen_tts ?? null)
+const qwenModelsReady = computed(() => Boolean(
+  qwenTts.value?.status === 'ready'
+  && qwenTts.value.runtime_available
+  && qwenTts.value.candidate_generation_available
+  && qwenTts.value.models.voice_design.available
+  && qwenTts.value.models.base.available,
+))
+const candidateTextLength = computed(() => [...candidateText.value.trim()].length)
+const candidateStyleLength = computed(() => [...candidateStylePrompt.value.trim()].length)
+const candidateSeedNumber = computed(() => {
+  if (!/^\d+$/.test(candidateSeed.value.trim())) return null
+  const seed = Number(candidateSeed.value)
+  return Number.isSafeInteger(seed) && seed >= 0 && seed <= 4_294_967_295 ? seed : null
+})
+const candidateFormValid = computed(() => candidateTextLength.value >= 1
+  && candidateTextLength.value <= 160
+  && candidateStyleLength.value >= 1
+  && candidateStyleLength.value <= 500
+  && candidateSeedNumber.value !== null)
+const canGenerateVoiceCandidate = computed(() => Boolean(
+  isOwner.value
+  && qwenModelsReady.value
+  && candidateFormValid.value
+  && !candidateGenerating.value
+  && !candidatesLoading.value
+  && !candidateGenerationUncertain.value,
+))
+const candidateByVoiceId = (voiceId: string) => localVoiceCandidates.value.find((candidate) => candidate.voice_id === voiceId) ?? null
+const currentProfileCandidate = computed(() => {
+  const voiceId = voiceProfile.value?.profile?.voice_id
+  return voiceId?.startsWith('qwen3:') ? candidateByVoiceId(voiceId) : null
+})
+const profileCandidateMissing = computed(() => Boolean(
+  voiceProfile.value?.profile?.voice_id.startsWith('qwen3:')
+  && !currentProfileCandidate.value,
+))
+const approvalTextMatchesCandidateReference = computed(() => Boolean(
+  currentProfileCandidate.value
+  && sampleText.value.trim() === currentProfileCandidate.value.reference_text.trim(),
+))
+const canCreateApprovalPreview = computed(() => Boolean(
+  voiceProfile.value?.profile
+  && selectedVoiceId.value === voiceProfile.value.profile.voice_id
+  && !profileCandidateMissing.value
+  && (!currentProfileCandidate.value || qwenModelsReady.value)
+  && !approvalTextMatchesCandidateReference.value
+  && sampleText.value.trim()
+  && sampleText.value.length <= 240
+  && !previewing.value
+  && !approvalPreviewUncertain.value,
+))
+const asrRuntimeReady = computed(() => Boolean(
+  asr.value?.status === 'ready'
+  && asr.value.runtime_available
+  && asr.value.selected_model_id === 'small'
+  && asr.value.model_candidates.some((candidate) => candidate.model_id === 'small' && candidate.installed),
+))
+const asrFileAccept = computed(() => (asr.value?.accepted_formats ?? []).map((format) => `.${format.replace(/^\./, '')}`).join(','))
+const selectedAsrFileIssue = computed(() => {
+  const file = selectedAsrFile.value
+  if (!file) return ''
+  if (!file.size) return '所选文件为空。'
+  if (asr.value && file.size > asr.value.max_bytes) return `文件超过本机限制 ${(asr.value.max_bytes / (1024 * 1024)).toFixed(0)} MiB。`
+  const extension = file.name.split('.').at(-1)?.toLowerCase() ?? ''
+  const accepted = (asr.value?.accepted_formats ?? []).map((format) => format.replace(/^\./, '').toLowerCase())
+  if (accepted.length && !accepted.includes(extension)) return `当前文件扩展名不在支持列表中（${accepted.join('、')}）；文件内容仍由本机服务实际解码校验。`
+  return ''
+})
+const asrModelCandidatesSummary = computed(() => (asr.value?.model_candidates ?? [])
+  .map((candidate) => `${candidate.model_id}（${candidate.installed ? '已安装' : '未安装'}）`)
+  .join('、') || '无')
+const transcriptionDuration = computed(() => {
+  const result = transcription.value
+  if (!result) return null
+  if (typeof result.duration_seconds === 'number') return result.duration_seconds
+  const source = result.source
+  return source && 'duration_seconds' in source && typeof source.duration_seconds === 'number'
+    ? source.duration_seconds
+    : null
+})
 const selectedRoomItem = computed(() => roomItems.value.find((item) => item.id === selectedRoomItemId.value) ?? null)
 const mediaItemOptions = computed(() => roomItems.value
   .filter((item) => Boolean(item.managed_media_id))
@@ -98,7 +207,8 @@ const latestVoiceReply = computed(() => {
 const canSaveVoiceProfile = computed(() => Boolean(
   voiceProfile.value
   && selectedVoiceId.value
-  && tts.value?.voices.some((voice) => voice.voice_id === selectedVoiceId.value)
+  && (tts.value?.voices.some((voice) => voice.voice_id === selectedVoiceId.value)
+    || localVoiceCandidates.value.some((candidate) => candidate.voice_id === selectedVoiceId.value && candidate.status === 'unapproved'))
   && voiceProfile.value.profile?.voice_id !== selectedVoiceId.value
   && !savingVoiceProfile.value
 ))
@@ -107,6 +217,8 @@ const canApprovePreview = computed(() => Boolean(
   && approvalPreview.value?.purpose === 'approval_preview'
   && approvalPreview.value.profile_version === voiceProfile.value.profile.profile_version
   && voiceProfile.value.approval?.profile_version !== voiceProfile.value.profile.profile_version
+  && selectedVoiceId.value === voiceProfile.value.profile.voice_id
+  && !profileCandidateMissing.value
   && !approvingVoice.value
 ))
 const canCreateVoiceBatch = computed(() => Boolean(
@@ -272,7 +384,10 @@ async function loadTtsCapabilities() {
   notice.value = ''
   try {
     tts.value = await api.ttsCapabilities()
-    if (!selectedVoiceId.value || !tts.value.voices.some((voice) => voice.voice_id === selectedVoiceId.value)) {
+    const selectedIsAvailable = tts.value.voices.some((voice) => voice.voice_id === selectedVoiceId.value)
+      || localVoiceCandidates.value.some((candidate) => candidate.voice_id === selectedVoiceId.value)
+      || selectedVoiceId.value.startsWith('qwen3:')
+    if (!selectedVoiceId.value || !selectedIsAvailable) {
       selectedVoiceId.value = tts.value.voices[0]?.voice_id ?? ''
     }
     notice.value = '本机语音状态已读取；页面没有播放或批准任何声音。'
@@ -282,6 +397,91 @@ async function loadTtsCapabilities() {
   } finally {
     voicesLoading.value = false
   }
+}
+
+function clearCandidateAudio() {
+  if (candidateAudioUrl.value) URL.revokeObjectURL(candidateAudioUrl.value)
+  candidateAudioUrl.value = ''
+  candidateAudioId.value = ''
+}
+
+function candidateRequestMessage(cause: unknown) {
+  if (!(cause instanceof ApiRequestError)) return errorMessage(cause)
+  if (cause.code === 'local_audio_busy') return '本机语音处理通道正忙；候选没有排队或自动重试，稍后由你手动重新生成。'
+  if (cause.code === 'local_audio_timeout') return '本机候选生成超时；服务端已停止本次工作。请先刷新候选列表确认结果，再决定是否重新生成。'
+  if (['qwen_runtime_unavailable', 'qwen_resource_unavailable', 'qwen_resource_mismatch'].includes(cause.code)) {
+    return '本机 Qwen 运行时或固定模型资源尚未就绪；不会自动下载、切换模型或改用云服务。请重新读取本机语音能力。'
+  }
+  if (['qwen_worker_failed', 'qwen_output_invalid'].includes(cause.code)) return '本机候选生成失败或结果未通过校验；请检查状态后再决定是否重新生成。'
+  if (cause.httpStatus === 422) return '候选文字需为 1–160 字，风格提示为 1–500 字，seed 必须是 0 到 4294967295 的整数。'
+  return errorMessage(cause)
+}
+
+async function loadVoiceCandidates() {
+  if (!isOwner.value || candidatesLoading.value || candidateGenerating.value) return
+  candidatesLoading.value = true
+  candidateError.value = ''
+  try {
+    const data = await api.voiceCandidates()
+    localVoiceCandidates.value = data.items
+    candidateGenerationUncertain.value = false
+    if (candidateAudioId.value && !data.items.some((candidate) => candidate.candidate_id === candidateAudioId.value)) clearCandidateAudio()
+    candidateNotice.value = '候选列表已读取；没有播放、选择 profile 或批准任何声音。'
+  } catch (cause) {
+    candidateError.value = candidateRequestMessage(cause)
+  } finally {
+    candidatesLoading.value = false
+  }
+}
+
+async function generateVoiceCandidate() {
+  const seed = candidateSeedNumber.value
+  if (!canGenerateVoiceCandidate.value || seed === null) return
+  candidateGenerating.value = true
+  candidateError.value = ''
+  candidateNotice.value = ''
+  try {
+    const candidate = await api.createVoiceCandidate({
+      text: candidateText.value.trim(),
+      style_prompt: candidateStylePrompt.value.trim(),
+      seed,
+    })
+    localVoiceCandidates.value = [candidate, ...localVoiceCandidates.value.filter((item) => item.candidate_id !== candidate.candidate_id)]
+    candidateGenerationUncertain.value = false
+    candidateNotice.value = '本机候选已生成并保存；尚未播放、选择为 profile 或批准。请手动读取参考音频试听，再决定是否设为 profile 草稿。'
+  } catch (cause) {
+    candidateError.value = candidateRequestMessage(cause)
+    if (cause instanceof ApiRequestError
+      && cause.code !== 'local_audio_busy'
+      && (!cause.httpStatus || cause.retryable || cause.httpStatus >= 500)) {
+      candidateGenerationUncertain.value = true
+      candidateNotice.value = '候选生成结果可能未知；请先刷新候选列表确认状态，没有自动重试。'
+    }
+  } finally {
+    candidateGenerating.value = false
+  }
+}
+
+async function loadCandidateAudio(candidate: LocalVoiceCandidate) {
+  if (candidateAudioLoadingId.value) return
+  candidateAudioLoadingId.value = candidate.candidate_id
+  candidateError.value = ''
+  try {
+    const audio = await api.voiceCandidateAudio(candidate.candidate_id)
+    clearCandidateAudio()
+    candidateAudioUrl.value = URL.createObjectURL(audio)
+    candidateAudioId.value = candidate.candidate_id
+    candidateNotice.value = '候选参考 WAV 已读取；请用播放器手动试听。页面不会自动播放。'
+  } catch (cause) {
+    candidateError.value = candidateRequestMessage(cause)
+  } finally {
+    candidateAudioLoadingId.value = ''
+  }
+}
+
+function selectVoiceCandidate(candidate: LocalVoiceCandidate) {
+  selectedVoiceId.value = candidate.voice_id
+  candidateNotice.value = '已选中本机候选作为待保存的 profile 选择；尚未修改 profile。下一步需单独保存新版本，再生成 Base 复用试听。'
 }
 
 async function loadVoiceProfile() {
@@ -301,7 +501,9 @@ async function loadVoiceProfile() {
 
 async function saveVoiceProfile() {
   const current = voiceProfile.value
-  if (!current || !selectedVoiceId.value || !tts.value?.voices.some((voice) => voice.voice_id === selectedVoiceId.value) || savingVoiceProfile.value) return
+  const selectedVoiceAvailable = tts.value?.voices.some((voice) => voice.voice_id === selectedVoiceId.value)
+    || localVoiceCandidates.value.some((candidate) => candidate.voice_id === selectedVoiceId.value && candidate.status === 'unapproved')
+  if (!current || !selectedVoiceId.value || !selectedVoiceAvailable || savingVoiceProfile.value) return
   savingVoiceProfile.value = true
   error.value = ''
   notice.value = ''
@@ -350,7 +552,7 @@ async function saveVoiceSettings(next: { runtime_enabled: boolean; voice_outbox_
 
 async function createApprovalPreview() {
   const current = voiceProfile.value
-  if (!current?.profile || !sampleText.value.trim() || sampleText.value.length > 240 || previewing.value || approvalPreviewUncertain.value) return
+  if (!canCreateApprovalPreview.value || !current?.profile) return
   previewing.value = true
   error.value = ''
   notice.value = ''
@@ -869,6 +1071,93 @@ async function loadAsrCapabilities() {
   }
 }
 
+function selectAsrFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  selectedAsrFile.value = input.files?.item(0) ?? null
+  transcription.value = null
+  asrUploadError.value = ''
+  asrUploadNotice.value = ''
+  chatResult.value = null
+  chatUncertain.value = false
+  lastChatRequestId.value = ''
+}
+
+function asrUploadErrorMessage(cause: unknown) {
+  if (!(cause instanceof ApiRequestError)) return errorMessage(cause)
+  if (cause.code === 'request_cancelled') return '本次转写请求已取消；本机服务会清理临时音频并停止工作进程。'
+  if (cause.code === 'asr_busy' || cause.code === 'local_audio_busy') return '本机 ASR 正忙；请求未排队，也没有自动重试。请稍后再由你发起转写。'
+  if (cause.code === 'asr_model_unavailable') return '本地 ASR 模型暂不可用。请重新读取资源状态后再试。'
+  if (cause.httpStatus === 413 || cause.code === 'audio_too_large') return '音频超过本机 64 MiB 限制，未转写。'
+  if (cause.httpStatus === 415) return '本机服务不接受此媒体类型；请选择 WAV、MP3、M4A、OGG 或 FLAC 音频。'
+  if (cause.httpStatus === 422 || ['unsupported_audio_format', 'invalid_audio_container', 'audio_too_long'].includes(cause.code)) {
+    return '本机无法解码此文件，或音频超过 120 秒限制；未提交聊天。请检查格式和时长后再试。'
+  }
+  if (cause.httpStatus === 504 || cause.code === 'asr_worker_timeout') return '本机转写超时，服务端已停止工作进程并清理临时音频；没有自动重试。'
+  return errorMessage(cause)
+}
+
+async function transcribeSelectedFile() {
+  const file = selectedAsrFile.value
+  if (!isOwner.value || !file || !asrRuntimeReady.value || selectedAsrFileIssue.value || transcribing.value || !asr.value) return
+  const controller = new AbortController()
+  asrUploadController.value = controller
+  transcribing.value = true
+  asrUploadError.value = ''
+  asrUploadNotice.value = ''
+  error.value = ''
+  notice.value = ''
+  transcription.value = null
+  chatResult.value = null
+  chatUncertain.value = false
+  lastChatRequestId.value = ''
+  try {
+    transcription.value = await api.transcribeUploadedAudio(file, controller.signal)
+    notice.value = '本机离线转写已完成；文本尚未提交聊天。'
+  } catch (cause) {
+    if (cause instanceof ApiRequestError && cause.code === 'request_cancelled') {
+      asrUploadNotice.value = asrUploadErrorMessage(cause)
+    } else {
+      asrUploadError.value = asrUploadErrorMessage(cause)
+    }
+  } finally {
+    if (asrUploadController.value === controller) asrUploadController.value = null
+    transcribing.value = false
+  }
+}
+
+function cancelAsrTranscription() {
+  if (!asrUploadController.value) return
+  asrUploadNotice.value = '已请求取消；等待本机服务停止识别并清理临时音频。'
+  asrUploadController.value.abort()
+}
+
+function formatSrtTime(seconds: number) {
+  const milliseconds = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : 0
+  const hours = Math.floor(milliseconds / 3_600_000)
+  const minutes = Math.floor((milliseconds % 3_600_000) / 60_000)
+  const wholeSeconds = Math.floor((milliseconds % 60_000) / 1000)
+  const fraction = milliseconds % 1000
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(wholeSeconds).padStart(2, '0')},${String(fraction).padStart(3, '0')}`
+}
+
+function formatSegmentRange(start: number, end: number) {
+  return `${formatSrtTime(start)} – ${formatSrtTime(end)}`
+}
+
+function downloadAsrSubtitles() {
+  const segments = transcription.value?.segments ?? []
+  if (!segments.length) return
+  const content = segments.map((segment, index) => `${index + 1}\n${formatSrtTime(segment.start)} --> ${formatSrtTime(segment.end)}\n${segment.text}`).join('\n\n') + '\n'
+  const url = URL.createObjectURL(new Blob([`\uFEFF${content}`], { type: 'application/x-subrip;charset=utf-8' }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = 'asr-subtitles.srt'
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 async function loadRoomMediaIndex() {
   loadingRooms.value = true
   error.value = ''
@@ -891,7 +1180,7 @@ async function loadRoomMediaIndex() {
 
 async function transcribe() {
   const item = selectedRoomItem.value
-  if (!item || !asr.value || asr.value.status !== 'ready' || transcribing.value) return
+  if (!item || !asrRuntimeReady.value || transcribing.value) return
   transcribing.value = true
   error.value = ''
   notice.value = ''
@@ -992,10 +1281,15 @@ watch(selectedVoiceConversationId, () => { void loadVoiceConversationMessages();
 watch(selectedVoiceBatchId, (batchId) => {
   if (replyArtifactBinding.value && batchId !== replyArtifactBinding.value.batch_id) clearReplyArtifact()
 })
+watch(selectedVoiceId, (voiceId) => {
+  if (voiceId !== voiceProfile.value?.profile?.voice_id) clearPreview()
+})
 onMounted(() => { void loadVoiceProfile() })
 onUnmounted(() => {
+  asrUploadController.value?.abort()
   if (replyAuthorizationExpiryTimer) window.clearTimeout(replyAuthorizationExpiryTimer)
   clearPreview()
+  clearCandidateAudio()
   clearReplyArtifact()
 })
 </script>
@@ -1014,12 +1308,76 @@ onUnmounted(() => {
     <NAlert v-if="error" type="error" :show-icon="true" title="语音请求未完成">{{ error }}</NAlert>
     <NAlert v-if="notice" type="success" :show-icon="true">{{ notice }}</NAlert>
     <NAlert type="info" :show-icon="true" title="语音安全边界">
-      本机 SAPI 当前只提供普通朗读，不能作为已完成 C07 表达控制的证据。批准只绑定当前 profile 版本；语音授权与 Outbox 草稿分两步确认。本页面不会自动批准、授权或发送；派发只能在 Outbox 通过服务端最新预检后再次确认。语音输入只读取已登记的托管 WAV，不会下载模型。
+      Qwen VoiceDesign 候选由应用本机生成，qwen3 候选 ID 只是不可变资源引用，不是真实 speaker ID，也不保证跨文本音色完全一致。参考音频需由你手动读取和试听；保存为 profile、Base 复用试听和批准仍是分开的操作。本页面不会自动播放、批准、授权或发送。ASR 不录制麦克风、不上传第三方，也不会自动提交聊天。
     </NAlert>
 
     <section class="content-grid">
       <NCard class="panel-card" :bordered="false">
-        <template #header><div class="card-heading"><div><h2>本机朗读试听</h2><p>先手动读取能力，再生成短 WAV 预览。</p></div><AppIcon name="play" /></div></template>
+        <template #header><div class="card-heading"><div><h2>原创声线候选</h2><p>用本机 VoiceDesign 显式生成一份自创参考，再由你手动试听。</p></div><AppIcon name="play" /></div></template>
+        <div class="voice-panel">
+          <div class="voice-status">
+            <span>Qwen 运行状态</span><StatusPill :status="qwenTts?.status || 'unknown'" />
+            <span>运行时</span><StatusPill :status="qwenTts?.runtime_available ? 'ready' : 'needs_resource'" />
+            <span>设备 / 精度</span><strong>{{ qwenTts ? `${qwenTts.device} · ${qwenTts.dtype} · ${qwenTts.attn_implementation}` : '先读取本机语音能力' }}</strong>
+          </div>
+          <div class="voice-actions">
+            <NButton secondary :loading="voicesLoading" @click="loadTtsCapabilities">读取 Qwen 本机资源状态</NButton>
+            <NButton secondary :loading="candidatesLoading" :disabled="candidateGenerating" @click="loadVoiceCandidates">读取已生成候选</NButton>
+          </div>
+          <NAlert v-if="!qwenTts" type="info" :show-icon="true">请读取本机语音能力以检查固定的 VoiceDesign 和 Base 资源；不会自动下载或更换模型。</NAlert>
+          <NAlert v-else-if="!qwenModelsReady" type="warning" :show-icon="true">{{ qwenTts.detail }} 不会自动下载、转用云服务或切换到其他模型。</NAlert>
+          <NAlert type="info" :show-icon="true">资源就绪只表示本机可以尝试生成，不代表音色已验证。模型未完整安装时无法生成；生成成功后，请先手动试听参考音频，再单独确认批准该声音。</NAlert>
+          <p v-if="qwenModelsReady" class="capability-detail">资源与解释器状态已就绪；自动下载：{{ qwenTts?.downloads_enabled ? '开启' : '关闭' }} · 远程代码：{{ qwenTts?.trust_remote_code ? '允许' : '关闭' }}。此状态不代表声音效果已验证。</p>
+          <div v-if="qwenTts" class="candidate-models">
+            <div class="candidate-model">
+              <span>{{ qwenTts.models.voice_design.model_id || 'VoiceDesign' }} · {{ qwenTts.models.voice_design.revision || '版本未报告' }}</span>
+              <StatusPill :status="qwenTts.models.voice_design.available ? 'ready' : 'needs_resource'" />
+              <small>资源指纹：{{ qwenTts.models.voice_design.resource_fingerprint || '尚未提供' }}</small>
+            </div>
+            <div class="candidate-model">
+              <span>{{ qwenTts.models.base.model_id || 'Base' }} · {{ qwenTts.models.base.revision || '版本未报告' }}</span>
+              <StatusPill :status="qwenTts.models.base.available ? 'ready' : 'needs_resource'" />
+              <small>资源指纹：{{ qwenTts.models.base.resource_fingerprint || '尚未提供' }}</small>
+            </div>
+          </div>
+          <NAlert v-if="!isOwner" type="info" :show-icon="true">本机原创候选仅对 owner 开放。</NAlert>
+          <template v-else>
+            <div class="voice-form candidate-form">
+              <label class="field-label" for="voice-candidate-text">原创参考文字（1–160 字）</label>
+              <NInput id="voice-candidate-text" v-model:value="candidateText" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" maxlength="160" :disabled="candidateGenerating" />
+              <small class="capability-detail">{{ candidateTextLength }} / 160 字。内容仅用于本次本机声线设计。</small>
+              <label class="field-label" for="voice-candidate-style">风格提示（1–500 字）</label>
+              <NInput id="voice-candidate-style" v-model:value="candidateStylePrompt" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" maxlength="500" :disabled="candidateGenerating" />
+              <small class="capability-detail">{{ candidateStyleLength }} / 500 字。请描述声音表现，不要指定或仿制真实人物。</small>
+              <label class="field-label" for="voice-candidate-seed">Seed（0–4294967295）</label>
+              <input id="voice-candidate-seed" v-model="candidateSeed" class="candidate-seed" type="number" min="0" max="4294967295" step="1" :disabled="candidateGenerating" />
+              <NAlert v-if="candidateSeedNumber === null" type="warning" :show-icon="true">Seed 必须是 0 到 4294967295 的整数。</NAlert>
+              <NButton type="primary" :loading="candidateGenerating" :disabled="!canGenerateVoiceCandidate" @click="generateVoiceCandidate">在本机生成候选</NButton>
+            </div>
+            <NAlert v-if="candidateGenerationUncertain" type="warning" :show-icon="true">生成结果可能未知。先点击“读取已生成候选”核对状态，再决定是否重新生成。</NAlert>
+            <NAlert v-if="candidateNotice" type="info" :show-icon="true">{{ candidateNotice }}</NAlert>
+            <NAlert v-if="candidateError" type="error" :show-icon="true" title="本机候选操作未完成">{{ candidateError }}</NAlert>
+            <NEmpty v-if="!localVoiceCandidates.length && !candidatesLoading" description="还没有已读取的本机候选" />
+            <div v-for="candidate in localVoiceCandidates" :key="candidate.candidate_id" class="voice-candidate">
+              <div class="candidate-heading"><strong>未批准候选 · {{ candidate.candidate_id }}</strong><StatusPill :status="candidate.status" /></div>
+              <p class="candidate-reference">{{ candidate.reference_text }}</p>
+              <small>风格：{{ candidate.style_prompt }} · seed {{ candidate.seed }}</small>
+              <small>VoiceDesign：{{ candidate.design.model_id }} · {{ candidate.design.revision }} · 指纹 {{ candidate.design.resource_fingerprint }}</small>
+              <small>Base 资源：{{ candidate.base.model_id }} · {{ candidate.base.revision }} · 指纹 {{ candidate.base.resource_fingerprint }}</small>
+              <small>参考 WAV：{{ candidate.duration_ms === null ? '时长未知' : `${candidate.duration_ms}ms` }} · {{ candidate.byte_length === null ? '大小未知' : `${(candidate.byte_length / 1024).toFixed(1)} KiB` }} · SHA-256 {{ candidate.reference_sha256 }}</small>
+              <small>生成时间：{{ candidate.created_at }} · qwen3 候选引用不承诺固定 speaker 身份。</small>
+              <div class="voice-actions">
+                <NButton size="small" secondary :loading="candidateAudioLoadingId === candidate.candidate_id" :disabled="Boolean(candidateAudioLoadingId)" @click="loadCandidateAudio(candidate)">读取参考 WAV 供手动试听</NButton>
+                <NButton size="small" secondary :disabled="selectedVoiceId === candidate.voice_id" @click="selectVoiceCandidate(candidate)">{{ voiceProfile?.profile?.voice_id === candidate.voice_id ? '当前 profile' : selectedVoiceId === candidate.voice_id ? '已选为待保存' : '设为 profile 待保存选择' }}</NButton>
+              </div>
+              <audio v-if="candidateAudioId === candidate.candidate_id && candidateAudioUrl" :src="candidateAudioUrl" controls preload="none" aria-label="本机候选参考音频手动播放器">当前浏览器不支持 WAV 播放。</audio>
+            </div>
+          </template>
+        </div>
+      </NCard>
+
+      <NCard class="panel-card" :bordered="false">
+        <template #header><div class="card-heading"><div><h2>Profile 试听与批准</h2><p>选择候选只会准备待保存选择；Base 复用和批准另行手动发起。</p></div><AppIcon name="play" /></div></template>
         <div class="voice-panel">
           <NButton secondary :loading="voiceProfileLoading" @click="loadVoiceProfile">读取 profile、批准和运行状态</NButton>
           <div v-if="voiceProfile" class="voice-status voice-status--profile">
@@ -1032,12 +1390,13 @@ onUnmounted(() => {
           </div>
           <div v-if="voiceProfile" class="voice-form">
             <NButton secondary :loading="voicesLoading" @click="loadTtsCapabilities">读取本机语音能力</NButton>
-            <label class="field-label" for="tts-voice">选择本机已安装语音</label>
-            <NSelect id="tts-voice" v-model:value="selectedVoiceId" :options="voiceOptions" :disabled="!tts?.voices.length || voicesLoading || previewing || savingVoiceProfile" placeholder="先读取本机语音" />
+            <label class="field-label" for="tts-voice">选择本机声音或已生成候选</label>
+            <NSelect id="tts-voice" v-model:value="selectedVoiceId" :options="voiceOptions" :disabled="!voiceOptions.length || voicesLoading || previewing || savingVoiceProfile" placeholder="先读取本机语音或候选" />
             <NPopconfirm v-if="canSaveVoiceProfile" @positive-click="saveVoiceProfile">
-              <template #trigger><NButton secondary :loading="savingVoiceProfile" :disabled="!canSaveVoiceProfile">保存为新 profile 版本</NButton></template>
+              <template #trigger><NButton secondary :loading="savingVoiceProfile" :disabled="!canSaveVoiceProfile">保存为新 profile 版本（未批准）</NButton></template>
               保存会创建不可变 profile 并撤销旧批准。下一步仍须单独生成试听并由你明确批准，确认继续？
             </NPopconfirm>
+            <small v-if="selectedVoiceId.startsWith('qwen3:') && selectedVoiceId !== voiceProfile.profile?.voice_id" class="capability-detail">已选择候选资源引用；只有确认保存才会创建新的未批准 profile 版本。</small>
             <small class="capability-detail">当前 profile：{{ voiceProfile.profile ? `${voiceProfile.profile.voice_name} · ${voiceProfile.profile.voice_id} · v${voiceProfile.profile.profile_version} · ${voiceProfile.profile.capability}` : '尚未设置' }}。settings hash：{{ voiceProfile.profile?.settings_hash || '未提供' }}</small>
           </div>
           <div v-if="voiceProfile" class="voice-form">
@@ -1067,11 +1426,13 @@ onUnmounted(() => {
             <span>引擎</span><strong>{{ tts?.engine_id || '尚未读取' }}</strong>
           </div>
           <p v-if="tts?.detail" class="capability-detail">{{ tts.detail }}</p>
-          <NEmpty v-if="tts && !tts.voices.length" description="当前接口未返回可用语音" />
+          <NEmpty v-if="tts && !voiceOptions.length" description="当前接口未返回可用语音或已读取候选" />
           <div class="voice-form">
-            <label class="field-label" for="tts-text">审批试听文字（最多 240 字）</label>
+            <label class="field-label" for="tts-text">{{ currentProfileCandidate ? 'Base 复用试听文字（最多 240 字，须与候选参考不同）' : '审批试听文字（最多 240 字）' }}</label>
             <NInput id="tts-text" v-model:value="sampleText" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" maxlength="240" :disabled="previewing" />
-            <NButton type="primary" :loading="previewing" :disabled="!voiceProfile?.profile || !sampleText.trim() || sampleText.length > 240 || approvalPreviewUncertain" @click="createApprovalPreview">生成 profile 试听素材</NButton>
+            <NAlert v-if="profileCandidateMissing" type="warning" :show-icon="true">当前 profile 引用本机候选；请读取候选列表后再试听，以核对其 reference hash 与模型绑定。</NAlert>
+            <NAlert v-else-if="approvalTextMatchesCandidateReference" type="warning" :show-icon="true">Base 复用试听文字须与 VoiceDesign 候选的参考文字不同。</NAlert>
+            <NButton type="primary" :loading="previewing" :disabled="!canCreateApprovalPreview" @click="createApprovalPreview">{{ currentProfileCandidate ? '在本机生成 Base 复用试听' : '生成 profile 试听素材' }}</NButton>
           </div>
           <div v-if="approvalPreview" class="audio-preview">
             <strong>未批准的 profile 试听素材</strong>
@@ -1095,23 +1456,58 @@ onUnmounted(() => {
       </NCard>
 
       <NCard class="panel-card" :bordered="false">
-        <template #header><div class="card-heading"><div><h2>房间语音输入</h2><p>从已登记的托管媒体索引选择 WAV，不浏览目录。</p></div><AppIcon name="book" /></div></template>
+        <template #header><div class="card-heading"><div><h2>本机语音输入</h2><p>可选择单个本机音频文件，或沿用已登记的房间媒体入口。</p></div><AppIcon name="book" /></div></template>
         <div class="voice-panel">
-          <div class="voice-status"><span>ASR 状态</span><StatusPill :status="asr?.status || 'unknown'" /><span>执行配置</span><strong>{{ asr ? `${asr.compute_type} · ${asr.max_duration_seconds}s 上限` : '尚未读取' }}</strong></div>
+          <div class="voice-status">
+            <span>ASR 状态</span><StatusPill :status="asr?.status || 'unknown'" />
+            <span>本机运行时</span><StatusPill :status="asr?.runtime_available ? 'ready' : 'needs_resource'" />
+            <span>执行配置</span><strong>{{ asr ? `${asr.selected_model_id || '未选择模型'} · ${asr.device}/${asr.compute_type} · ${asr.max_duration_seconds}s / ${(asr.max_bytes / 1024 / 1024).toFixed(0)} MiB 上限` : '尚未读取' }}</strong>
+          </div>
           <p v-if="asr?.detail" class="capability-detail">{{ asr.detail }}</p>
           <NButton secondary :loading="asrLoading" @click="loadAsrCapabilities">检查本地 ASR 资源</NButton>
-          <NButton secondary :loading="loadingRooms" @click="loadRoomMediaIndex">读取房间媒体索引</NButton>
-          <NEmpty v-if="!roomItems.length" description="尚未载入可用的房间媒体索引" />
-          <template v-else>
-            <label class="field-label" for="asr-room-item">房间媒体条目</label>
-            <NSelect id="asr-room-item" v-model:value="selectedRoomItemId" :options="mediaItemOptions" :disabled="loadingRooms || transcribing" />
-            <small class="capability-detail">允许类型：{{ asr?.accepted_formats.join('、') || '读取 ASR 状态后显示' }}；文件大小上限：{{ asr ? `${(asr.max_bytes / 1024 / 1024).toFixed(0)} MiB` : '未知' }}。服务端会再次校验媒体类型、时长、来源和房间授权。</small>
-            <NButton type="primary" :loading="transcribing" :disabled="!selectedRoomItem || !asr || asr.status !== 'ready'" @click="transcribe">在本机转写</NButton>
-          </template>
-          <NAlert v-if="asr?.status === 'needs_resource'" type="warning" :show-icon="true">本机缺少已安装 ASR 资源；不会自动下载或转用付费云服务。</NAlert>
+          <NAlert v-if="asr?.status === 'needs_resource' || (asr && !asr.runtime_available)" type="warning" :show-icon="true">本机 ASR 尚未就绪；不会自动下载或转用付费云服务。</NAlert>
+          <NAlert v-if="asr && asr.status === 'partial'" type="info" :show-icon="true">ASR 能力当前为 partial；只有服务端报告模型已就绪时才可转写。</NAlert>
+
+          <div v-if="isOwner" class="voice-form asr-upload">
+            <label class="field-label" for="asr-local-file">选择本机音频</label>
+            <input id="asr-local-file" class="asr-file-input" type="file" :accept="asrFileAccept" :disabled="transcribing" @change="selectAsrFile" />
+            <small class="capability-detail">支持格式：{{ asr?.accepted_formats.join('、') || '读取本机能力后显示' }}；上限 {{ asr ? `${(asr.max_bytes / 1024 / 1024).toFixed(0)} MiB、${asr.max_duration_seconds} 秒` : '读取本机能力后显示' }}。选择文件不会上传或转写；只有点击下方按钮才将原始音频发送给同源本机服务。文件名仅在页面显示，不作为服务端路径。</small>
+            <div v-if="selectedAsrFile" class="asr-selected-file"><strong>{{ selectedAsrFile.name }}</strong><small>{{ (selectedAsrFile.size / 1024 / 1024).toFixed(2) }} MiB · {{ selectedAsrFile.type || '浏览器未报告媒体类型' }}</small></div>
+            <NAlert v-if="selectedAsrFileIssue" type="warning" :show-icon="true">{{ selectedAsrFileIssue }}</NAlert>
+            <div class="voice-actions">
+              <NButton type="primary" :loading="transcribing" :disabled="!selectedAsrFile || !asrRuntimeReady || Boolean(selectedAsrFileIssue) || transcribing" @click="transcribeSelectedFile">在本机转写</NButton>
+              <NButton v-if="asrUploadController" secondary @click="cancelAsrTranscription">取消本次转写</NButton>
+            </div>
+            <NAlert v-if="asrUploadNotice" type="info" :show-icon="true">{{ asrUploadNotice }}</NAlert>
+            <NAlert v-if="asrUploadError" type="error" :show-icon="true" title="本机转写未完成">{{ asrUploadError }}</NAlert>
+          </div>
+          <NAlert v-else type="info" :show-icon="true">本机文件转写仅对 owner 开放。</NAlert>
+
+          <div class="asr-room-source">
+            <strong>已登记的房间媒体</strong>
+            <NButton secondary :loading="loadingRooms" @click="loadRoomMediaIndex">读取房间媒体索引</NButton>
+            <NEmpty v-if="!roomItems.length" description="尚未载入可用的房间媒体索引" />
+            <template v-else>
+              <label class="field-label" for="asr-room-item">房间媒体条目</label>
+              <NSelect id="asr-room-item" v-model:value="selectedRoomItemId" :options="mediaItemOptions" :disabled="loadingRooms || transcribing" />
+              <small class="capability-detail">允许类型：{{ asr?.accepted_formats.join('、') || '读取 ASR 状态后显示' }}；文件大小与时长限制由本机服务再次校验。</small>
+              <NButton type="primary" :loading="transcribing" :disabled="!selectedRoomItem || !asrRuntimeReady || transcribing" @click="transcribe">在本机转写房间媒体</NButton>
+            </template>
+          </div>
+          <div v-if="asr" class="capability-flags">
+            <div><span>模型候选</span><strong>{{ asrModelCandidatesSummary }}</strong></div>
+            <div><span>设备与精度</span><strong>{{ asr.device }} · {{ asr.compute_type }}</strong></div>
+            <div><span>自动下载</span><strong>{{ asr.downloads_enabled ? '开启' : '关闭' }}</strong></div>
+            <div><span>聊天提交</span><strong>仅经单独确认</strong></div>
+          </div>
           <NAlert v-if="transcription" :type="transcription.transcript ? 'success' : 'info'" :show-icon="true">
-            <div>状态：{{ transcription.status }} · 聊天：{{ transcription.downstream.chat_service }} · 语音回复：{{ transcription.downstream.voice_reply }} · QQ Outbox：{{ transcription.downstream.qq_outbox }}</div>
+            <div>状态：{{ transcription.status }} · 语言：{{ transcription.language || '未识别' }} · 时长：{{ transcriptionDuration?.toFixed(2) || '未提供' }} 秒 · 聊天：{{ transcription.downstream.chat_service }} · 语音回复：{{ transcription.downstream.voice_reply }} · QQ Outbox：{{ transcription.downstream.qq_outbox }}</div>
+            <small v-if="transcription.source" class="transcript-source">{{ transcription.source.media_type }} · {{ (transcription.source.byte_length / 1024 / 1024).toFixed(2) }} MiB · SHA-256 {{ transcription.source.content_hash }}</small>
             <p v-if="transcription.transcript" class="transcript-text">{{ transcription.transcript }}</p>
+            <div v-if="transcription.segments?.length" class="transcript-segments">
+              <div class="voice-actions"><strong>分段结果（{{ transcription.segments.length }}）</strong><NButton size="small" secondary @click="downloadAsrSubtitles">下载 SRT 字幕</NButton></div>
+              <div v-for="(segment, index) in transcription.segments" :key="`${index}-${segment.start}`" class="transcript-segment"><small>{{ formatSegmentRange(segment.start, segment.end) }}</small><span>{{ segment.text }}</span></div>
+            </div>
           </NAlert>
           <div v-if="transcription?.transcript" class="transcript-submit">
             <NAlert type="warning" :show-icon="true">把转写文字提交到 ChatService 可能产生服务费用。这是单独的一次用户确认；不会自动播放、合成语音或发送 QQ。</NAlert>
@@ -1126,11 +1522,6 @@ onUnmounted(() => {
             <NButton v-if="lastChatRequestId" size="small" quaternary @click="checkChatRequest">查询最近 ChatService 请求</NButton>
             <NAlert v-if="chatUncertain" type="warning" :show-icon="true">请求结果未明；请先查询或刷新服务端状态，不要重复提交。</NAlert>
             <div v-if="chatResult" class="chat-result"><strong>ChatService 请求：{{ chatResult.request?.state || chatResult.request?.status || '状态未提供' }}</strong><small>request id：{{ chatResult.request?.local_request_id || chatResult.request?.request_id || '未提供' }}</small><p v-if="chatResult.message">{{ chatResult.message.content }}</p></div>
-          </div>
-          <div v-if="asr" class="capability-flags">
-            <div><span>本地模型候选</span><strong>{{ asr.model_candidates.join('、') || '无' }}</strong></div>
-            <div><span>自动下载</span><strong>关闭</strong></div>
-            <div><span>QQ 发送</span><strong>需要独立授权</strong></div>
           </div>
         </div>
       </NCard>
@@ -1226,6 +1617,24 @@ onUnmounted(() => {
 .voice-status strong { overflow-wrap: anywhere; color: var(--text); }
 .capability-detail { margin: 0; overflow-wrap: anywhere; color: var(--text-muted); font-size: 11px; line-height: 1.55; }
 .voice-form { display: grid; gap: 8px; }
+.candidate-form { padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.candidate-seed { width: 100%; min-height: 36px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--surface); font: inherit; }
+.candidate-models { display: grid; gap: 7px; }
+.candidate-model { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 9px; border-radius: 10px; background: var(--surface-soft); color: var(--text-soft); font-size: 10px; }
+.candidate-model span, .candidate-model small { overflow-wrap: anywhere; }
+.candidate-model small { grid-column: 1 / -1; color: var(--text-muted); }
+.voice-candidate { display: grid; gap: 7px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.candidate-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); font-size: 11px; }
+.voice-candidate small { color: var(--text-muted); font-size: 10px; overflow-wrap: anywhere; }
+.candidate-reference { margin: 0; color: var(--text-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
+.voice-candidate audio { width: 100%; }
+.asr-upload { padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.asr-file-input { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--surface); }
+.asr-selected-file { display: grid; gap: 3px; overflow-wrap: anywhere; }
+.asr-selected-file strong { color: var(--text); font-size: 11px; }
+.asr-selected-file small, .transcript-source { color: var(--text-muted); font-size: 10px; }
+.asr-room-source { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
+.asr-room-source > strong { color: var(--text-soft); font-size: 11px; }
 .audio-preview { display: grid; gap: 7px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
 .audio-preview strong { color: var(--text); font-size: 12px; }
 .audio-preview small { overflow-wrap: anywhere; color: var(--text-muted); font-size: 10px; }
@@ -1236,6 +1645,10 @@ onUnmounted(() => {
 .capability-flags > div { display: flex; justify-content: space-between; gap: 12px; color: var(--text-muted); font-size: 10px; }
 .capability-flags strong { color: var(--text-soft); text-align: right; }
 .transcript-text { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.transcript-segments { display: grid; gap: 6px; margin-top: 8px; }
+.transcript-segment { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; padding: 6px 8px; border-radius: 8px; background: var(--surface-soft); }
+.transcript-segment small { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.transcript-segment span { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-soft); }
 .transcript-submit { display: grid; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
 .conversation-gate { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 10px; color: var(--text-muted); font-size: 10px; }
 .conversation-gate strong, .chat-result strong { color: var(--text-soft); }

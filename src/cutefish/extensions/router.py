@@ -27,6 +27,7 @@ from .contracts import (
     RoomVersionAction,
     TaskCreate,
     TtsPreviewRequest,
+    VoiceCandidateCreate,
     VoicePreviewApproval,
     VoicePreviewCreate,
     VoiceProfilePut,
@@ -323,7 +324,56 @@ async def adapter_statuses(request: Request, _admin=Depends(require_admin)):
 
 @router.get("/extensions/tts")
 async def tts_capabilities(request: Request, _admin=Depends(require_admin)):
-    return _success(request, await asyncio.to_thread(_services(request)["tts"].inspect))
+    services = _services(request)
+    result = await asyncio.to_thread(services["tts"].inspect)
+    result["qwen_tts"] = await asyncio.to_thread(services["voice_candidates"].capabilities)
+    return _success(request, result)
+
+
+@router.post("/extensions/tts/candidates", status_code=201)
+async def create_voice_candidate(
+    request: Request, payload: VoiceCandidateCreate, _admin=Depends(require_admin)
+):
+    return await _respond(
+        request,
+        _services(request)["voice_candidates"].create(
+            text=payload.text,
+            style_prompt=payload.style_prompt,
+            seed=payload.seed,
+        ),
+        status_code=201,
+    )
+
+
+@router.get("/extensions/tts/candidates")
+async def list_voice_candidates(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _admin=Depends(require_admin),
+):
+    return await _respond(
+        request, _services(request)["voice_candidates"].list(limit=limit, offset=offset)
+    )
+
+
+@router.get("/extensions/tts/candidates/{candidate_id}/audio")
+async def voice_candidate_audio(
+    request: Request, candidate_id: str, _admin=Depends(require_admin)
+):
+    try:
+        audio = await _services(request)["voice_candidates"].audio(candidate_id)
+    except SpeechError as exc:
+        return _failure(request, exc)
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'inline; filename="cutefish-voice-candidate.wav"',
+            "X-Audio-Played": "false",
+        },
+    )
 
 
 @router.post("/extensions/tts/preview")
@@ -477,3 +527,41 @@ async def transcribe_room_media(
             chat_idempotency_key=payload.chat_idempotency_key,
         ),
     )
+
+
+@router.post("/extensions/asr/transcriptions/upload")
+async def transcribe_uploaded_audio(request: Request, _admin=Depends(require_admin)):
+    body_consumed = asyncio.Event()
+
+    async def upload_chunks():
+        async for chunk in request.stream():
+            yield chunk
+        # Only begin the disconnect watcher after request.stream() has consumed
+        # the full body, so it cannot race the upload reader for ASGI messages.
+        body_consumed.set()
+
+    transcription = asyncio.create_task(
+        _services(request)["asr"].transcribe_upload(
+            upload_chunks(),
+            content_type=request.headers.get("content-type"),
+            content_length=request.headers.get("content-length"),
+        )
+    )
+
+    async def cancel_when_disconnected():
+        await body_consumed.wait()
+        while True:
+            message = await request.receive()
+            if message.get("type") == "http.disconnect":
+                transcription.cancel()
+                return
+
+    disconnect_watcher = asyncio.create_task(cancel_when_disconnected())
+    try:
+        return await _respond(request, transcription)
+    finally:
+        disconnect_watcher.cancel()
+        try:
+            await disconnect_watcher
+        except asyncio.CancelledError:
+            pass

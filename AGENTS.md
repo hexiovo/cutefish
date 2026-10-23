@@ -6,7 +6,7 @@
 只能执行用户指定 Pxx；阶段内实现/排错/必要检查可连续完成，收尾向用户汇报后停止。允许真实子代理按文件边界并行；主代理串行整合共享状态、账本、QUICKSTART。没子代理工具或限额时串行，不伪造结果。
 
 ## 当前阶段与状态源
-截至 2026-10-23，S01（P00–P02）、S02（P03–P06）和 S03 bounded offline 范围已独立验收通过；当前执行 workflow_review 批准的 `execution / S04`，计划 hash `8522a37a703c24d176db6551a17299863310fcdbc7c72f3e8f36978d5cdd984f`。P00–P14 的实现、本机核验、目标核验和生产启用状态以工作区外部管理目录 `../manage/feature-status.json` 为唯一来源，相关阶段证据以该目录下的 reports 为准。
+截至 2026-10-23，S01（P00–P02）、S02（P03–P06）、S03 bounded offline 范围及 workflow_review 批准的 S07 technical route 均已有独立 acceptance。S07 G4 计划 hash `887b1fc4fe030fe7199870087fc92c8d25915230a055029231c2ec816fd3c88d`，canonical acceptance hash `f422062887d2f324f5eab9de7cd39d138f010821e2406d7d7e26d2adc0a3cadf`；权威报告/approval 见 `H:/AIcode/HexiPlan/runs/cutefish-implementation-20261023-01/reports/acceptance-S07-v1/report.html` 和 `H:/AIcode/HexiPlan/runs/cutefish-implementation-20261023-01/approvals/0028-step_acceptance.json`。最新 overall supplement 结论为 `PARTIAL_EXTERNAL_RESOURCE_BLOCKER`，handoff canonical hash `bf950db95d614f86fff79fc7c2b127ae44f791597e5b7244f353eba9f83a86a2`，报告 `H:/AIcode/HexiPlan/runs/cutefish-implementation-20261023-01/reports/supplement-03-handoff-v1/report.html`；Qwen 完整权重和双阶段 smoke 未就绪。P00–P14 的实现、本机核验、目标核验和生产启用状态以工作区外部管理目录 `../manage/feature-status.json` 为唯一来源，相关阶段证据以该目录下的 reports 为准。
 S04 当前仅做 `local_trial`、手动 loopback 和合成/离线检查。已填私稿保存在 Git 仓库外 `manage/private/confirmed-design-v4.9`；源文件正文不得复制进代码或公开报告。导入只允许 owner 显式操作，运行启动不扫描、不自动导入、不调用模型或批准人格。真实站点访问、外发、付费 API、迁移导入和目标机验证均未执行；production read/action registries 必须保持空，直到各自能力被核实并另行明确授权。
 
 ## 开发与真实对话

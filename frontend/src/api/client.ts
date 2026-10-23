@@ -3,6 +3,7 @@ import type {
   AsrCapabilities,
   AsrTranscriptionRequest,
   AsrTranscriptionResult,
+  AsrUploadTranscriptionResult,
   BudgetEntry,
   BudgetEntryState,
   BootstrapData,
@@ -25,6 +26,7 @@ import type {
   IntegrationSourceReadRequest,
   IntegrationSourceReadResult,
   HostSettings,
+  LocalVoiceCandidate,
   MemoryItem,
   ModuleConfigData,
   ModuleItem,
@@ -62,6 +64,7 @@ import type {
   TrialBatch,
   TrialBatchCreate,
   VisionCapability,
+  VisionObservationRequest,
   VisionObservationResult,
   UiSettings,
   VoiceApprovalResult,
@@ -106,6 +109,10 @@ export function setCsrfToken(token: string | null | undefined) {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function isAbortError(value: unknown): boolean {
+  return isObject(value) && value.name === 'AbortError'
 }
 
 async function postAudioPreview(path: string, payload: { text: string; voice_id: string; task_id?: string; expected_task_revision?: number }): Promise<TtsPreviewResult> {
@@ -213,6 +220,53 @@ async function getVoiceArtifactContent(artifactId: string): Promise<Blob> {
   return response.blob()
 }
 
+async function getVoiceCandidateAudio(candidateId: string): Promise<Blob> {
+  if (!candidateId.trim()) {
+    throw new ApiRequestError({ message: '本机候选引用无效，未读取音频。', code: 'invalid_voice_candidate' })
+  }
+
+  let response: Response
+  try {
+    response = await fetch(`/api/extensions/tts/candidates/${encodeURIComponent(candidateId)}/audio`, {
+      method: 'GET',
+      headers: { Accept: 'audio/wav, application/json' },
+      credentials: 'same-origin',
+    })
+  } catch {
+    throw new ApiRequestError({ message: '无法连接本机服务。请确认本机控制台已启动，再重试。', code: 'not_connected', retryable: true })
+  }
+
+  if (!response.ok) {
+    let body: unknown
+    try {
+      body = await response.json()
+    } catch {
+      body = null
+    }
+    const envelope = isObject(body) ? (body as unknown as ApiEnvelope<unknown>) : null
+    const errorBody = envelope?.error ?? undefined
+    throw new ApiRequestError({
+      message: errorBody?.message || `本机服务暂未完成此操作（HTTP ${response.status}）。`,
+      code: errorBody?.code || envelope?.status || 'voice_candidate_audio_unavailable',
+      retryable: errorBody?.retryable,
+      requestId: errorBody?.request_id || envelope?.request_id || null,
+      httpStatus: response.status,
+      details: errorBody?.details,
+    })
+  }
+
+  const mediaType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
+  if (mediaType !== 'audio/wav' || response.headers.get('X-Audio-Played') !== 'false') {
+    throw new ApiRequestError({
+      message: '本机候选接口没有返回标记为未播放的 WAV 音频；已丢弃响应。',
+      code: 'invalid_voice_candidate_audio',
+      httpStatus: response.status,
+    })
+  }
+
+  return response.blob()
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<ApiEnvelope<T>> {
   const method = (init.method ?? 'GET').toUpperCase()
   const headers = new Headers(init.headers)
@@ -228,7 +282,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<ApiEnve
   let response: Response
   try {
     response = await fetch(path, { ...init, method, headers, credentials: 'same-origin' })
-  } catch {
+  } catch (cause) {
+    if (isAbortError(cause)) {
+      throw new ApiRequestError({ message: '本机转写请求已取消。', code: 'request_cancelled' })
+    }
     throw new ApiRequestError({
       message: '无法连接本机服务。请确认本机控制台已启动，再重试。',
       code: 'not_connected',
@@ -239,7 +296,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<ApiEnve
   let body: unknown
   try {
     body = await response.json()
-  } catch {
+  } catch (cause) {
+    if (isAbortError(cause)) {
+      throw new ApiRequestError({ message: '本机转写请求已取消。', code: 'request_cancelled' })
+    }
     throw new ApiRequestError({
       message: `本机服务返回了无法识别的响应（HTTP ${response.status}）。`,
       code: 'invalid_response',
@@ -277,6 +337,8 @@ function data<T>(envelope: ApiEnvelope<T>): T {
 const get = <T>(path: string) => request<T>(path).then(data)
 const post = <T>(path: string, payload?: unknown) =>
   request<T>(path, { method: 'POST', body: payload === undefined ? undefined : JSON.stringify(payload) }).then(data)
+const postRaw = <T>(path: string, body: BodyInit, contentType: string, signal?: AbortSignal) =>
+  request<T>(path, { method: 'POST', body, headers: { 'Content-Type': contentType }, signal }).then(data)
 const patch = <T>(path: string, payload: unknown) =>
   request<T>(path, { method: 'PATCH', body: JSON.stringify(payload) }).then(data)
 const put = <T>(path: string, payload: unknown) =>
@@ -447,6 +509,10 @@ export const api = {
     share_allowed?: boolean
   }) => post<ManagedMedia>('/api/rooms/managed-media', payload),
   ttsCapabilities: () => get<TtsCapabilities>('/api/extensions/tts'),
+  voiceCandidates: () => get<{ items: LocalVoiceCandidate[] }>('/api/extensions/tts/candidates'),
+  createVoiceCandidate: (payload: { text: string; style_prompt: string; seed: number }) =>
+    post<LocalVoiceCandidate>('/api/extensions/tts/candidates', payload),
+  voiceCandidateAudio: (candidateId: string) => getVoiceCandidateAudio(candidateId),
   previewTts: (payload: { text: string; voice_id: string; task_id?: string; expected_task_revision?: number }) =>
     postAudioPreview('/api/extensions/tts/preview', payload),
   voiceProfile: () => get<VoiceProfileData>('/api/extensions/voice/profile'),
@@ -464,8 +530,15 @@ export const api = {
   asrCapabilities: () => get<AsrCapabilities>('/api/extensions/asr'),
   transcribeRoomAudio: (payload: AsrTranscriptionRequest) =>
     post<AsrTranscriptionResult>('/api/extensions/asr/transcriptions', payload),
+  transcribeUploadedAudio: (file: File, signal?: AbortSignal) =>
+    postRaw<AsrUploadTranscriptionResult>(
+      '/api/extensions/asr/transcriptions/upload',
+      file,
+      file.type || 'application/octet-stream',
+      signal,
+    ),
   visionCapability: () => get<VisionCapability>('/api/vision/capability'),
-  observeRoomMedia: (payload: { room_item_id: string; expected_room_version: number; detail_level?: 'low' | 'high' }) =>
+  observeRoomMedia: (payload: VisionObservationRequest) =>
     post<VisionObservationResult>('/api/vision/observe', payload),
   migrationStatus: () => get<MigrationStatus>('/api/migration/status'),
   inspectMigrationSource: () => post<MigrationPreflight>('/api/migration/inspect'),

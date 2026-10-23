@@ -46,10 +46,19 @@ class PersonaService:
         self.confirmed_design_import_root = confirmed_design_import_root
 
     async def confirmed_design_import_status(self) -> dict[str, Any]:
+        token_estimator_status = "partial"
+        try:
+            token_estimator_status = self.chat_service.prompt_builder.token_policy.status()["state"]
+        except Exception:
+            # Status remains partial when the controlled tokenizer is missing or
+            # no prompt builder is available to verify the local data resource.
+            pass
         context_capacity = {
             "target_tokens": {"owner": 131072, "contact": 32768},
-            "actual_max_utf8_bytes": {"owner": 131072, "contact": 32768},
+            "token_estimator_status": token_estimator_status,
             "token_capacity_status": "partial",
+            "hard_token_cap": False,
+            "request_body_max_utf8_bytes": 48 * 1024 * 1024,
         }
         if self.confirmed_design_import_root is None:
             return {

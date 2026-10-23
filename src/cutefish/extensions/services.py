@@ -10,6 +10,7 @@ from .rooms import ManagedMediaReader, RoomService, RoomSourceAuthorizer
 from .tasks import TaskService
 from .tts import TtsCapabilityProbe
 from .voice import VoiceService
+from .voice_candidates import VoiceCandidateService
 
 
 def create_services(context: Any) -> dict[str, Any]:
@@ -27,6 +28,13 @@ def create_services(context: Any) -> dict[str, Any]:
         media_reader=getattr(context, "room_media_reader", None) or ManagedMediaReader(context.paths),
     )
     tts = TtsCapabilityProbe(context.paths)
+    voice_candidates = VoiceCandidateService(
+        context.session_factory,
+        context.paths,
+        getattr(context, "qwen_tts_runtime", None),
+        getattr(context, "local_audio_lane", None),
+        deployment_profile=lambda: getattr(context, "deployment_profile", "local_trial"),
+    )
     return {
         "tasks": tasks,
         "candidates": CandidateService(
@@ -35,17 +43,22 @@ def create_services(context: Any) -> dict[str, Any]:
         ),
         "rooms": rooms,
         "tts": tts,
+        "voice_candidates": voice_candidates,
         "voice": VoiceService(
             context.session_factory,
             context.paths,
             tts,
             deployment_profile=lambda: getattr(context, "deployment_profile", "local_trial"),
             qq_service=getattr(context, "qq_service", None),
+            voice_candidates=voice_candidates,
+            qwen_tts_runtime=getattr(context, "qwen_tts_runtime", None),
+            local_audio_lane=getattr(context, "local_audio_lane", None),
         ),
         "asr": AsrService(
             context.paths,
             rooms,
             tasks,
             chat_service=getattr(context, "chat_service", None),
+            local_audio_lane=getattr(context, "local_audio_lane", None),
         ),
     }

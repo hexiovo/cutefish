@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 MigrationPolicyVersion = Literal[1]
@@ -66,6 +66,16 @@ class ManifestFile(StrictModel):
     byte_length: int = Field(ge=0)
     source_scope: Literal["production", "calibration"]
     version: int = Field(ge=1)
+    reason: Literal["selected_media", "approved_voice_preview", "voice_candidate_reference"] = "selected_media"
+    candidate_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def candidate_reference_has_identity(self) -> "ManifestFile":
+        if self.reason == "voice_candidate_reference" and self.candidate_id is None:
+            raise ValueError("voice candidate reference must identify its candidate")
+        if self.reason != "voice_candidate_reference" and self.candidate_id is not None:
+            raise ValueError("candidate_id is only allowed for a voice candidate reference")
+        return self
 
 
 class ManifestLogicalRoot(StrictModel):

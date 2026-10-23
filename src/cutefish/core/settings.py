@@ -46,6 +46,8 @@ class Settings(BaseModel):
     timezone: str = "Asia/Shanghai"
     roots: dict[str, str]
     allowed_origins: tuple[str, ...]
+    model_root: Path | None = None
+    qwen_tts_python: Path | None = None
     confirmed_design_import_root: Path | None = None
     host_config_status: str = "loaded"
 
@@ -77,6 +79,8 @@ def load_settings(
     }
     config_status = "missing"
     configured_feature_status = os.environ.get("CUTEFISH_FEATURE_STATUS")
+    model_root: Path | None = None
+    qwen_tts_python: Path | None = None
     confirmed_design_import_root: Path | None = None
     host_id_value: str | None = None
     if host_config.is_file():
@@ -99,6 +103,22 @@ def load_settings(
                         config_status = "invalid_room_root"
                 else:
                     config_status = "room_root_missing"
+                raw_model_root = payload.get("model_root")
+                if isinstance(raw_model_root, str) and raw_model_root.strip():
+                    candidate = Path(raw_model_root.strip()).expanduser()
+                    if candidate.is_absolute():
+                        # Keep the configured path lexical. HostPathResolver checks
+                        # every component for symlinks/junctions when an audio job
+                        # explicitly needs the model root.
+                        model_root = candidate
+                        roots["model_root"] = str(candidate)
+                raw_qwen_tts_python = payload.get("qwen_tts_python")
+                if isinstance(raw_qwen_tts_python, str) and raw_qwen_tts_python.strip():
+                    candidate = Path(raw_qwen_tts_python.strip()).expanduser()
+                    if candidate.is_absolute():
+                        # This is a controlled host-local interpreter path; the runtime
+                        # revalidates it as a regular file before any worker starts.
+                        qwen_tts_python = candidate
                 raw_host_id = payload.get("host_id")
                 if isinstance(raw_host_id, str) and raw_host_id.strip():
                     host_id_value = raw_host_id.strip()[:128]
@@ -159,6 +179,8 @@ def load_settings(
         host_id=host_id,
         roots=roots,
         allowed_origins=tuple(dict.fromkeys(origins)),
+        model_root=model_root,
+        qwen_tts_python=qwen_tts_python,
         confirmed_design_import_root=confirmed_design_import_root,
         host_config_status=config_status,
     )

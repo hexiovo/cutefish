@@ -367,8 +367,8 @@ onMounted(() => void refresh())
             <strong>{{ source.sha256 }}</strong>
           </div>
         </div>
-        <NAlert v-if="confirmedDesignImportInfo.context_capacity" type="info" :show-icon="true" title="上下文容量：partial">
-          目标是 owner {{ confirmedDesignImportInfo.context_capacity.target_tokens.owner.toLocaleString() }} token、联系人 {{ confirmedDesignImportInfo.context_capacity.target_tokens.contact.toLocaleString() }} token；当前实际限制是 owner {{ confirmedDesignImportInfo.context_capacity.actual_max_utf8_bytes.owner.toLocaleString() }} UTF-8 bytes（{{ (confirmedDesignImportInfo.context_capacity.actual_max_utf8_bytes.owner / 1024).toLocaleString() }} KiB）、联系人 {{ confirmedDesignImportInfo.context_capacity.actual_max_utf8_bytes.contact.toLocaleString() }} UTF-8 bytes（{{ (confirmedDesignImportInfo.context_capacity.actual_max_utf8_bytes.contact / 1024).toLocaleString() }} KiB）。字节限额不等同于 token 容量，目标 token 容量尚未实现并验证。
+        <NAlert v-if="confirmedDesignImportInfo.context_capacity" type="info" :show-icon="true" title="上下文容量：partial（本地估算）">
+          目标为 owner {{ confirmedDesignImportInfo.context_capacity.target_tokens.owner.toLocaleString() }} token、联系人 {{ confirmedDesignImportInfo.context_capacity.target_tokens.contact.toLocaleString() }} token。本地 tokenizer 对输入 token 数作估算（{{ confirmedDesignImportInfo.context_capacity.token_estimator_status === 'estimated' ? '估算可用' : '估算部分可用' }}）；总体容量仍为 partial，尚待真实模型和视觉路径验证，此估算不是模型端精确 token 硬上限。请求体另有全局 {{ (confirmedDesignImportInfo.context_capacity.request_body_max_utf8_bytes / 1024 / 1024).toLocaleString() }} MiB UTF-8 字节限制，与 token 估算分开。
         </NAlert>
       </div>
       <NEmpty v-else-if="!confirmedDesignImportError" description="正在读取安全来源状态；不会自动导入" />

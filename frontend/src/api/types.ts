@@ -461,6 +461,53 @@ export interface TtsCapabilities {
   audio_played: false
   model_downloaded: false
   detail: string
+  qwen_tts?: QwenTtsCapabilities | null
+}
+
+export interface QwenTtsModelCapability {
+  model_id?: string
+  revision?: string
+  available: boolean
+  resource_fingerprint?: string | null
+}
+
+export interface QwenTtsCapabilities {
+  status: 'ready' | 'needs_resource' | 'unavailable' | (string & {})
+  runtime_available: boolean
+  candidate_generation_available: boolean
+  downloads_enabled: false
+  trust_remote_code: false
+  device: string
+  dtype: string
+  attn_implementation: string
+  models: {
+    voice_design: QwenTtsModelCapability
+    base: QwenTtsModelCapability
+  }
+  detail: string
+}
+
+export interface LocalVoiceCandidate {
+  candidate_id: string
+  voice_id: `qwen3:${string}`
+  reference_text: string
+  style_prompt: string
+  seed: number
+  reference_sha256: string
+  duration_ms: number | null
+  byte_length: number | null
+  created_at: string
+  status: 'unapproved'
+  design: {
+    model_id: string
+    revision: string
+    resource_fingerprint: string
+  }
+  base: {
+    model_id: string
+    revision: string
+    resource_fingerprint: string
+  }
 }
 
 export interface TtsPreviewResult {
@@ -531,13 +578,28 @@ export interface VoiceApprovalResult {
 }
 
 export interface AsrCapabilities {
-  status: 'ready' | 'needs_resource' | 'unsupported' | (string & {})
-  model_candidates: string[]
+  status: 'ready' | 'partial' | 'needs_resource' | 'unsupported' | (string & {})
+  runtime_available: boolean
+  model_candidates: AsrModelCandidate[]
+  selected_model_id: string | null
+  device: string
   compute_type: string
   max_duration_seconds: number
   max_bytes: number
   accepted_formats: string[]
+  downloads_enabled: false
   detail?: string | null
+}
+
+export interface AsrModelCandidate {
+  model_id: string
+  installed: boolean
+}
+
+export interface AsrTranscriptionSegment {
+  start: number
+  end: number
+  text: string
 }
 
 export interface AsrTranscriptionRequest {
@@ -555,6 +617,8 @@ export interface AsrTranscriptionResult {
   status: 'needs_resource' | 'transcribed' | (string & {})
   transcript: string | null
   language?: string | null
+  duration_seconds?: number | null
+  segments?: AsrTranscriptionSegment[]
   source?: {
     room_item_id: string
     room_version: number
@@ -571,6 +635,26 @@ export interface AsrTranscriptionResult {
   chat_request?: ChatRequestStatus | null
   detail?: string
   [key: string]: unknown
+}
+
+export interface AsrUploadTranscriptionResult {
+  status: 'transcribed' | (string & {})
+  transcript: string
+  language: string | null
+  duration_seconds: number
+  segments: AsrTranscriptionSegment[]
+  source: {
+    kind: 'owner_upload'
+    media_type: string
+    byte_length: number
+    content_hash: string
+  }
+  downstream: {
+    chat_service: 'not_started'
+    voice_reply: 'not_approved'
+    qq_outbox: 'not_started'
+  }
+  detail: string
 }
 
 export interface ManagedMedia {
@@ -590,35 +674,74 @@ export interface ManagedMedia {
 }
 
 export interface VisionCapability {
-  state: 'needs_model_verification' | 'needs_resource' | (string & {})
+  state: 'code_ready_needs_live_verification' | 'needs_configuration' | 'needs_resource' | (string & {})
   visual_model_status: string
   pricing_status: string
+  provider: string
+  model: string
+  uses_files_api: false
+  supported_detail_levels: Array<'low' | 'high' | 'original' | 'auto'>
   decoder_available: boolean
+  dispatch_configured: boolean
   supported_mime_types: string[]
   max_bytes: number
+  max_request_bytes: number
+  max_image_edge: number
   max_pixels: number
 }
 
-export interface VisionObservationResult {
-  state: string
-  media: {
-    room_item_id: string
-    room_item_version: number
-    managed_media_id: string
-    sha256: string
-    mime_type: string
-    width: number
-    height: number
-    pixel_count: number
-    byte_length: number
-    root_key: string
-    relative_path: string
-    media_version: number
-    pixel_digest: string
-  }
-  observation: null
+export interface VisionObservationRequest {
+  room_item_id: string
+  expected_room_version: number
+  idempotency_key: string
+  detail_level?: 'low' | 'high' | 'original' | 'auto'
+}
+
+export interface VisionObservationMedia {
+  room_item_id: string
+  room_item_version: number
+  managed_media_id: string
+  sha256: string
+  mime_type: string
+  width: number
+  height: number
+  pixel_count: number
+  byte_length: number
+  root_key: string
+  relative_path: string
+  media_version: number
+  pixel_digest: string
+}
+
+interface VisionObservationBase {
+  media: VisionObservationMedia
   source_refs: SourceReference[]
 }
+
+export type VisionObservationResult =
+  | (VisionObservationBase & {
+    state: 'duplicate'
+    observation: null
+    duplicate_of_media_id: string
+  })
+  | (VisionObservationBase & {
+    state: 'observed'
+    observation: string
+    duplicate_of_media_id: null
+    model: string
+    provider_response_id: string
+    usage: {
+      input_tokens: number
+      output_tokens: number
+      cache_hit_tokens: number | null
+      cache_miss_tokens: number | null
+      total_tokens?: number
+      cost_basis?: string
+    }
+    actual_cost: number
+    budget_state: string
+    visual_model_status: string
+  })
 
 export interface MigrationRestorePolicy {
   external_actions_enabled: false
@@ -889,8 +1012,10 @@ export interface ConfirmedDesignImportInfo {
   sources: ConfirmedDesignImportSource[]
   context_capacity: {
     target_tokens: { owner: 131072; contact: 32768 }
-    actual_max_utf8_bytes: { owner: number; contact: number }
     token_capacity_status: 'partial'
+    token_estimator_status: 'estimated' | 'partial'
+    hard_token_cap: false
+    request_body_max_utf8_bytes: 50331648
   }
 }
 

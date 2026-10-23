@@ -17,6 +17,9 @@ dependencies = [
   "argon2-cffi>=23.1,<26.0",
   "openai>=1.55,<2.0",
   "Pillow>=11.0,<13.0",
+  "faster-whisper==1.2.1",
+  "av>=18,<19",
+  "tokenizers==0.23.3",
 ]
 
 [project.scripts]

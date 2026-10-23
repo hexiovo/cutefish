@@ -1,11 +1,68 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { NAlert, NButton, NCard, NEmpty, NInput, NPopconfirm, NSelect, NTag } from 'naive-ui'
-import { api } from '../api/client'
+import { ApiRequestError, api } from '../api/client'
 import { errorMessage } from '../api/errors'
-import type { ManagedMedia, RoomContentRead, RoomExportResult, RoomItem, RoomItemCreate, RoomSourceScope, RoomStatus, SourceReference, SourceReferenceKind, VisionCapability, VisionObservationResult } from '../api/types'
+import type { ManagedMedia, RoomContentRead, RoomExportResult, RoomItem, RoomItemCreate, RoomSourceScope, RoomStatus, SourceReference, SourceReferenceKind, VisionCapability, VisionObservationRequest, VisionObservationResult } from '../api/types'
 import AppIcon from '../components/AppIcon.vue'
 import StatusPill from '../components/StatusPill.vue'
+
+const visionAttemptStorageKey = 'cutefish:rooms:vision-pending:v1'
+
+interface StoredVisionAttempt {
+  request: VisionObservationRequest
+  retryable: boolean
+}
+
+function isVisionDetailLevel(value: unknown): value is NonNullable<VisionObservationRequest['detail_level']> {
+  return value === 'low' || value === 'high' || value === 'original' || value === 'auto'
+}
+
+function readStoredVisionAttempt(): StoredVisionAttempt | null {
+  try {
+    const raw = sessionStorage.getItem(visionAttemptStorageKey)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const record = parsed as Record<string, unknown>
+    if (typeof record.retryable !== 'boolean' || typeof record.request !== 'object' || record.request === null) return null
+    const request = record.request as Record<string, unknown>
+    const detail = request.detail_level
+    if (
+      typeof request.room_item_id !== 'string'
+      || !request.room_item_id
+      || typeof request.expected_room_version !== 'number'
+      || !Number.isInteger(request.expected_room_version)
+      || request.expected_room_version < 1
+      || typeof request.idempotency_key !== 'string'
+      || !request.idempotency_key
+      || request.idempotency_key.length > 256
+      || (detail !== undefined && !isVisionDetailLevel(detail))
+    ) return null
+    return {
+      request: {
+        room_item_id: request.room_item_id,
+        expected_room_version: request.expected_room_version,
+        idempotency_key: request.idempotency_key,
+        ...(isVisionDetailLevel(detail) ? { detail_level: detail } : {}),
+      },
+      retryable: record.retryable,
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeStoredVisionAttempt(attempt: StoredVisionAttempt | null) {
+  try {
+    if (attempt) sessionStorage.setItem(visionAttemptStorageKey, JSON.stringify(attempt))
+    else sessionStorage.removeItem(visionAttemptStorageKey)
+  } catch {
+    // A blocked browser storage API must not prevent the explicit request.
+  }
+}
+
+const storedVisionAttempt = readStoredVisionAttempt()
 
 const status = ref<RoomStatus | null>(null)
 const items = ref<RoomItem[]>([])
@@ -29,9 +86,13 @@ const visionCapability = ref<VisionCapability | null>(null)
 const loadingVision = ref(false)
 const observingMedia = ref(false)
 const visionObservation = ref<VisionObservationResult | null>(null)
+const visionRetryRequest = ref<VisionObservationRequest | null>(storedVisionAttempt?.retryable ? storedVisionAttempt.request : null)
+const visionOutcomeUncertain = ref(Boolean(storedVisionAttempt))
+const visionConfirmationItem = ref<RoomItem | null>(null)
 
 const writeAllowed = computed(() => Boolean(status.value?.configured && status.value.authorization_state === 'granted'))
 const roots = computed(() => status.value?.configured ? 'room_root 已配置' : 'room_root 未配置')
+const visionCanAnalyze = computed(() => canAnalyzeVision(selected.value))
 const kindOptions = [
   { label: '全部类型', value: '' },
   { label: '收藏集合', value: 'collection' },
@@ -260,7 +321,7 @@ async function loadVisionCapability() {
   notice.value = ''
   try {
     visionCapability.value = await api.visionCapability()
-    notice.value = '本地视觉解码能力已读取；没有调用视觉模型或读取媒体内容。'
+    notice.value = '本机视觉能力与配置状态已读取；此操作没有读取图片或调用模型。'
   } catch (cause) {
     error.value = errorMessage(cause)
     visionCapability.value = null
@@ -269,24 +330,80 @@ async function loadVisionCapability() {
   }
 }
 
-async function observeSelectedMedia(item: RoomItem) {
-  if (!item.managed_media_id || observingMedia.value) return
+function canAnalyzeVision(item: RoomItem | null) {
+  return Boolean(
+    item?.managed_media_id
+    && item.state === 'ready'
+    && status.value?.configured
+    && status.value.disk_state === 'available'
+    && status.value.authorization_state === 'granted'
+    && visionCapability.value?.decoder_available
+    && visionCapability.value.dispatch_configured
+    && !observingMedia.value
+    && !visionRetryRequest.value,
+  )
+}
+
+function prepareVisionConfirmation(item: RoomItem | null) {
+  visionConfirmationItem.value = item ? { ...item } : null
+}
+
+function confirmVisionObservation() {
+  const item = visionConfirmationItem.value
+  if (!item || selected.value?.id !== item.id) {
+    error.value = '当前选中的房间条目已变化；请重新打开确认框并核对图片。'
+    return
+  }
+  void observeSelectedMedia(item)
+}
+
+async function submitVisionObservation(payload: VisionObservationRequest) {
+  if (observingMedia.value) return
   observingMedia.value = true
+  visionRetryRequest.value = payload
+  visionOutcomeUncertain.value = true
+  writeStoredVisionAttempt({ request: payload, retryable: true })
   error.value = ''
   notice.value = ''
   visionObservation.value = null
   try {
-    visionObservation.value = await api.observeRoomMedia({
-      room_item_id: item.id,
-      expected_room_version: item.version,
-      detail_level: 'low',
-    })
-    notice.value = '静态图片已由本地解码并建立 provenance；视觉模型仍未核验，没有生成观察文字或调用 DeepSeek。'
+    visionObservation.value = await api.observeRoomMedia(payload)
+    visionRetryRequest.value = null
+    visionOutcomeUncertain.value = false
+    writeStoredVisionAttempt(null)
+    notice.value = visionObservation.value.state === 'duplicate'
+      ? '本机发现相同图像登记；这次没有再次调用视觉模型。'
+      : '视觉模型已返回观察结果；请同时核对模型核验与预算结算状态。'
   } catch (cause) {
     error.value = errorMessage(cause)
+    if (cause instanceof ApiRequestError && cause.retryable) {
+      visionRetryRequest.value = payload
+      visionOutcomeUncertain.value = true
+      writeStoredVisionAttempt({ request: payload, retryable: true })
+    } else {
+      visionRetryRequest.value = null
+      visionOutcomeUncertain.value = cause instanceof ApiRequestError && cause.code === 'request_already_dispatched'
+      writeStoredVisionAttempt(visionOutcomeUncertain.value ? { request: payload, retryable: false } : null)
+    }
   } finally {
     observingMedia.value = false
   }
+}
+
+async function observeSelectedMedia(item: RoomItem) {
+  if (!canAnalyzeVision(item) || !item.managed_media_id) return
+  await submitVisionObservation({
+    room_item_id: item.id,
+    expected_room_version: item.version,
+    idempotency_key: crypto.randomUUID(),
+    detail_level: 'low',
+  })
+}
+
+async function retryVisionObservation() {
+  const request = visionRetryRequest.value
+  if (!request || observingMedia.value) return
+  await submitVisionObservation({ ...request })
 }
 
 function contentBytes(encoding: RoomContentRead['encoding'] | RoomExportResult['content']['encoding'], value: string) {
@@ -429,6 +546,13 @@ onMounted(() => void refresh())
     </header>
 
     <NAlert v-if="error" type="warning" :show-icon="true" title="房间请求未完成">{{ error }}</NAlert>
+    <NAlert v-if="visionRetryRequest" type="warning" :show-icon="true" title="视觉请求结果未确认">
+      上次对 {{ visionRetryRequest.room_item_id }} 的请求可能已经派发，费用状态也可能未知。不会自动重发；如要重试，只能用原请求和同一幂等键。
+      <NButton size="small" secondary :disabled="observingMedia" :loading="observingMedia" @click="retryVisionObservation">以同一幂等键重试原请求</NButton>
+    </NAlert>
+    <NAlert v-else-if="visionOutcomeUncertain" type="warning" :show-icon="true" title="上次视觉请求可能已派发">
+      服务已拒绝重复派发该幂等键，但原请求结果或费用仍可能未知。请先核对预算流水；若仍选择发起新分析，确认框会提示其可能产生额外费用。
+    </NAlert>
     <NAlert v-if="status?.authorization_state !== 'granted'" type="warning" :show-icon="true" title="房间操作待授权">
       当前授权状态：{{ status?.authorization_state || '未知' }}。本机目录映射不会自动授予角色工作区权限；本页不扫描文件，也不会写入 I 盘。
     </NAlert>
@@ -498,15 +622,40 @@ onMounted(() => void refresh())
         <div v-if="selected" class="room-detail">
           <NTag round size="small">{{ selected.source_scope }} · 用途范围</NTag>
           <div class="room-detail__meta"><div><span>路径</span><strong>{{ selected.relative_path || '未登记' }}</strong></div><div><span>来源</span><strong>{{ selected.source_refs.map(formatSourceReference).join('；') || '未提供' }}</strong></div><div><span>内容 hash</span><strong>{{ selected.content_hash || '未提供' }}</strong></div><div><span>标签</span><strong>{{ selected.tags.join(' · ') || '无' }}</strong></div><div><span>创建</span><strong>{{ formatTime(selected.created_at) }}</strong></div><div><span>更新</span><strong>{{ formatTime(selected.updated_at) }}</strong></div></div>
-          <section v-if="selected.managed_media_id" class="vision-panel" aria-label="本地图片解码">
-            <div class="vision-panel__heading"><strong>本地静态图片解码</strong><NButton size="small" quaternary :loading="loadingVision" @click="loadVisionCapability">读取能力状态</NButton></div>
-            <div class="vision-panel__meta"><span>托管媒体 ID</span><strong>{{ selected.managed_media_id }}</strong><span>能力状态</span><StatusPill :status="visionCapability?.state || 'not_checked'" /></div>
-            <div v-if="visionCapability" class="vision-panel__meta"><span>视觉模型</span><StatusPill :status="visionCapability.visual_model_status" /><span>计价状态</span><StatusPill :status="visionCapability.pricing_status" /><span>格式 / 上限</span><strong>{{ visionCapability.supported_mime_types.join('、') }} · {{ (visionCapability.max_bytes / 1024 / 1024).toFixed(0) }} MiB · {{ (visionCapability.max_pixels / 1000000).toFixed(0) }} MP</strong></div>
-            <small>仅 PNG/JPEG；此操作在你点击后读取一个已登记条目并本地解码，不调用视觉模型或 DeepSeek。</small>
-            <NButton size="small" secondary :disabled="!visionCapability?.decoder_available || observingMedia" :loading="observingMedia" @click="observeSelectedMedia(selected)">解码这张图片并记录来源</NButton>
-            <NAlert v-if="visionCapability && visionCapability.state === 'needs_model_verification'" type="warning" :show-icon="true">目前只有本机静态图片解码和来源登记。P07 仍缺视觉模型 image request/response adapter 代码，且视觉模型与价格尚未核验；不会生成图像理解结果或调用模型。</NAlert>
+          <section v-if="selected.managed_media_id" class="vision-panel" aria-label="图像分析">
+            <div class="vision-panel__heading"><strong>图像分析</strong><NButton size="small" quaternary :loading="loadingVision" @click="loadVisionCapability">读取本地能力状态</NButton></div>
+            <div class="vision-panel__meta"><span>托管媒体 ID</span><strong>{{ selected.managed_media_id }}</strong><span>条目状态</span><StatusPill :status="selected.state" /><span>房间授权</span><StatusPill :status="status?.authorization_state || 'unknown'" /><span>磁盘缓存</span><StatusPill :status="status?.disk_state || 'unknown'" /></div>
+            <div v-if="visionCapability" class="vision-panel__meta">
+              <span>能力状态</span><strong>{{ visionCapability.state === 'code_ready_needs_live_verification' ? '代码已接通，视觉能力待核验' : visionCapability.state === 'needs_configuration' ? '预算、凭据服务或 Provider 尚未接通' : visionCapability.state === 'needs_resource' ? '缺少本地图像解码资源' : visionCapability.state }}</strong>
+              <span>视觉模型</span><strong>{{ visionCapability.provider }} / {{ visionCapability.model }} · {{ visionCapability.visual_model_status === 'needs_live_verification' ? '尚未联网核验' : visionCapability.visual_model_status }}</strong>
+              <span>图像计价</span><strong>{{ visionCapability.pricing_status === 'conservative_peak_reservation_only' ? '当前按保守峰值预留，实际按 API 用量结算' : visionCapability.pricing_status }}</strong>
+              <span>预算 / 凭据服务 / Provider 接线</span><StatusPill :status="visionCapability.dispatch_configured ? 'ready' : 'needs_configuration'" />
+              <span>本地解码器</span><StatusPill :status="visionCapability.decoder_available ? 'ready' : 'needs_resource'" />
+              <span>格式与图片上限</span><strong>{{ visionCapability.supported_mime_types.join('、') }} · {{ (visionCapability.max_bytes / 1024 / 1024).toFixed(0) }} MiB · {{ (visionCapability.max_pixels / 1000000).toFixed(0) }} MP · 最长边 {{ visionCapability.max_image_edge }} px</strong>
+            </div>
+            <small>读取能力状态不会读取图片或调用模型。点击“分析”后还会由服务端核验精确的条目读取授权、媒体批准、API 凭据和预算；这里显示的 room_root 授权状态不代表这些检查已经通过。</small>
+            <NAlert v-if="visionCapability" type="warning" :show-icon="true" title="可能产生外部模型费用">
+              视觉能力与图片计价尚未完成真实调用核验。确认后，本条已登记图片内容会发送至 {{ visionCapability.provider }} 的 {{ visionCapability.model }} 接口进行分析；不会自动发送或分析其他文件。
+            </NAlert>
+            <NPopconfirm positive-text="确认发送并分析图片" negative-text="取消" @positive-click="confirmVisionObservation">
+              <template #trigger><NButton size="small" type="primary" :disabled="!visionCanAnalyze" :loading="observingMedia" @click="prepareVisionConfirmation(selected)">分析这张图片（可能收费）</NButton></template>
+              <div class="vision-confirmation">
+                <strong>图片：{{ visionConfirmationItem?.title || selected.title }}</strong>
+                <p>确认后仅分析这张图片，并将图片内容发送给 DeepSeek。当前预算按峰值价格保守预留，单次最高约 ¥2.129920；最终费用按 API 返回的实际用量结算，可能低于预留值。</p>
+                <p>当前代码的模型能力和图片计价仍待真实核验。房间授权、媒体批准、凭据与预算可用性会在派发前由本机服务再次检查。</p>
+                <p v-if="visionOutcomeUncertain">上一请求的费用或结果仍可能未知；本次会使用全新的幂等键，可能产生另一笔费用。</p>
+              </div>
+            </NPopconfirm>
             <div v-if="visionObservation" class="vision-result">
-              <strong>{{ visionObservation.state }} · observation={{ visionObservation.observation === null ? 'null（未调用模型）' : '已返回' }}</strong>
+              <strong>{{ visionObservation.state === 'duplicate' ? '发现已登记的相同图像' : '图像分析结果' }}</strong>
+              <p v-if="visionObservation.state === 'observed'">{{ visionObservation.observation }}</p>
+              <span v-if="visionObservation.state === 'duplicate'">相同图像已存在：{{ visionObservation.duplicate_of_media_id }}；这次没有再次调用模型或产生模型费用。</span>
+              <template v-else>
+                <span>模型：{{ visionObservation.model }} · 响应 ID：{{ visionObservation.provider_response_id }}</span>
+                <span>按返回用量计算费用：¥{{ visionObservation.actual_cost.toFixed(6) }} · 预算状态：<StatusPill :status="visionObservation.budget_state" /></span>
+                <span>用量：输入 {{ visionObservation.usage.input_tokens }} tokens / 输出 {{ visionObservation.usage.output_tokens }} tokens；cache hit {{ visionObservation.usage.cache_hit_tokens ?? '未知' }} / miss {{ visionObservation.usage.cache_miss_tokens ?? '未知' }}</span>
+                <NAlert v-if="visionObservation.budget_state === 'unknown'" type="warning" :show-icon="true">模型已返回内容，但预算结算状态未知；请先在预算流水中核对，不要把这笔请求当作未发生。</NAlert>
+              </template>
               <span>{{ visionObservation.media.mime_type }} · {{ visionObservation.media.width }} × {{ visionObservation.media.height }} · {{ visionObservation.media.pixel_count }} pixels</span>
               <span>SHA-256：{{ visionObservation.media.sha256 }} · pixel digest：{{ visionObservation.media.pixel_digest }}</span>
               <span>来源：{{ visionObservation.source_refs.map(formatSourceReference).join('；') || '未提供' }}</span>
@@ -580,6 +729,8 @@ onMounted(() => void refresh())
 .vision-panel__heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .vision-panel__meta { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; align-items: center; color: var(--text-muted); font-size: 10px; }
 .vision-panel__meta strong { overflow-wrap: anywhere; color: var(--text-soft); }
+.vision-confirmation { display: grid; max-width: 360px; gap: 6px; }
+.vision-confirmation p, .vision-result p { margin: 0; color: var(--text-soft); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
 .source-ref-list { display: grid; gap: 8px; }
 .source-ref-list > small { color: var(--text-muted); font-size: 10px; }
 .source-ref-row { display: grid; grid-template-columns: minmax(130px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) minmax(130px, 0.8fr) auto; gap: 6px; align-items: center; }

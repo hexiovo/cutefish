@@ -15,6 +15,8 @@ from cutefish.integrations.evidence import EvidenceStore
 from cutefish.integrations.registry import PRODUCTION_HANDLER_REGISTRY
 from cutefish.memory.service import MemoryService
 from cutefish.qq.service import QqError, QqService
+from cutefish.local_audio import LocalAudioLane
+from cutefish.local_audio.qwen_runtime import QwenTtsRuntime
 
 from .auth import AuthService
 from .authorization import AuthorizationService
@@ -142,7 +144,16 @@ class Context:
         self.runtime_policy_valid = True
         self.db = Database(settings.database_path)
         self.session_factory = self.db.session_factory
+        self.model_root = settings.model_root
         self.paths = HostPathResolver(settings.roots)
+        # The shared lane owns no model state. It only serializes explicit local
+        # audio jobs and provides a per-job, disposable worker environment.
+        self.local_audio_lane = LocalAudioLane(self.paths, model_root=self.model_root)
+        self.qwen_tts_runtime = QwenTtsRuntime(
+            paths=self.paths,
+            model_root=self.model_root,
+            interpreter_path=settings.qwen_tts_python,
+        )
         self.secrets = SecretStore(self.session_factory)
         self.registry = ModuleRegistry()
         self._register_application_modules()

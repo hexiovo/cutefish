@@ -188,21 +188,44 @@ class BudgetService:
             await connection.execute(BudgetEntry.__table__.insert().values(**values))
             return self._serialize(values)
 
-    async def mark_dispatched(self, reservation_id: str) -> dict[str, Any]:
+    async def mark_dispatched(
+        self,
+        reservation_id: str,
+        *,
+        strict_first_claim: bool = False,
+    ) -> dict[str, Any]:
+        """Mark a reservation dispatched, optionally requiring the first claim.
+
+        The default remains idempotent for existing callers. A strict caller
+        gets a durable compare-and-set: exactly one reserved row can transition
+        to dispatched, and retries that see the dispatched row are rejected.
+        """
         async with self.db.immediate_transaction() as connection:
             row = await self._entry(connection, reservation_id)
             if row is None:
                 raise BudgetError("reservation_not_found", "费用预留不存在。", 404)
             if row["state"] == "dispatched":
+                if strict_first_claim:
+                    raise BudgetError("dispatch_already_claimed", "此请求的派发权已被其他调用领取。", 409)
                 return self._serialize(row)
             if row["state"] != "reserved":
+                if strict_first_claim:
+                    raise BudgetError("dispatch_already_claimed", "此请求的派发权已被其他调用领取或终结。", 409)
                 raise BudgetError("invalid_reservation_state", "只有未派发的预留可以派发。", 409)
             now = utc_now()
-            await connection.execute(
+            result = await connection.execute(
                 BudgetEntry.__table__.update()
-                .where(BudgetEntry.reservation_id == reservation_id)
+                .where(
+                    BudgetEntry.reservation_id == reservation_id,
+                    BudgetEntry.state == "reserved",
+                )
                 .values(state="dispatched", dispatched_at=now)
             )
+            if result.rowcount != 1:
+                latest = await self._entry(connection, reservation_id)
+                if strict_first_claim and latest is not None and latest["state"] != "reserved":
+                    raise BudgetError("dispatch_already_claimed", "此请求的派发权已被其他调用领取。", 409)
+                raise BudgetError("invalid_reservation_state", "只有未派发的预留可以派发。", 409)
             return self._serialize({**row, "state": "dispatched", "dispatched_at": now})
 
     async def settle_verified(self, evidence: ProviderUsageEvidence) -> dict[str, Any]:

@@ -175,6 +175,9 @@ class VoiceProfileVersion(Base):
     voice_id: Mapped[str] = mapped_column(String(512), nullable=False)
     voice_name: Mapped[str] = mapped_column(String(256), nullable=False)
     culture: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Null preserves the legacy settings-hash contract; non-SAPI engines bind
+    # their immutable, server-resolved configuration into the profile hash.
+    engine_config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     settings_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
