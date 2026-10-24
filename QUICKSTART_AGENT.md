@@ -1,8 +1,8 @@
 # QUICKSTART_AGENT / CuteFish Codex 4.9
 
-> 先读本文件与 AGENTS.md；S08 本机 Qwen 两阶段技术验收已接受。项目实施、本机核验、目标核验和正式启用分开记录；源执行包只读。
+> 先读本文件与 AGENTS.md；S10 三段 Qwen 参考试听技术验收已接受，用户主观选择仍待反馈。项目实施、本机核验、目标核验和正式启用分开记录；源执行包只读。
 
-当前状态：S08 已 ACCEPTED / phasecomplete（sequence 189），canonical acceptance hash `e081820a7d9e52273773dd9e5972568a1a351c3c9399e969aaddff965bcada28`；本机固定 Qwen 资源及指定短句 VoiceDesign→Base 技术验收通过。当前信息性交接 hash `fe72a2ea103c1762257f37dbdab298212e425ab487325313b74fb4cd3532685d`。可以试听 `../manage/resources/qwen-voice-design-20261024.wav` 与 `../manage/resources/qwen-base-preview-20261024.wav`；人工音质判断/批准、QQ/codec、付费视觉、目标机及 production 仍 pending。S06 旧 partial 和 supplement-03-v1 均作为历史保留。
+当前状态：S10 已 ACCEPTED / phasecomplete（sequence 241），canonical acceptance hash `07d9495d7c7c956b3415aa90655ca906e438eb8e3404549efa16afa9a64c98dc`；S10 两段参考与实验 Mix 的三条 Base `x_vector_only` 试听已完成技术验收。S09 两段试听被用户以“太成熟”拒绝并保留。S10 三段的主观相似度、Mix 听感和最终选择仍待反馈，未登记候选、未批准声音或启用 production；S08 acceptance 与 supplement-03 handoff-v2 保留为历史。详见 `../manage/reports/acceptance-S10-v1/report.html` 和 receipt `../manage/reports/acceptance-S10-v1/0041-step_acceptance.json`。
 唯一交付状态源：`../manage/feature-status.json`，按 P00–P14 分别记录实现、本机核验、目标核验和正式启用证据。
 当前 Git 提交/推送结果记录在工作区外部管理目录 `../manage/HANDOFF.md`。不扩大审查、不重跑旧验证。owner 尚未导入 bundle 或启动 calibration 试聊；当前仅 local_trial 手动 loopback，不访问真实站点、不调用付费 API、不外发、不执行迁移。
 
@@ -19,14 +19,14 @@
 | P07 | partial | 仅有本地图片解码；仍需图像请求/响应 adapter 代码，视觉能力与计价未证实 | feature-status.json |
 | P08 | partial | S03 受限集成基础与 mock 测试；站点目标/真实 handler 未配置 | `../manage/reports\S03-集成接口合同.md` |
 | P09 | partial | 持久候选/本地控制已有；主动调度和真实互动未启用 | feature-status.json |
-| P10 | partial | S05 ASR 已验收；S08 Qwen 固定资源和本机两阶段短句技术验收通过，等待 owner 试听/批准 | `../manage/feature-status.json` 与 `../manage/reports/acceptance-S08-v1/report.html` |
+| P10 | partial | S05 ASR 与 S08 技术范围已验收；S09 试听被拒，S10 三段参考试听技术验收通过，等待用户主观选择 | `../manage/feature-status.json` 与 `../manage/reports/acceptance-S10-v1/report.html` |
 | P11 | partial | QQ语音发送结构有部分实现；NapCat codec 未实证，默认仍文字 | feature-status.json |
 | P12 | partial | S03 证据绑定动作预览；生产 handler 为空、未真实派发 | `../manage/reports\S03-集成接口合同.md` |
 | P13 | partial | 迁移说明/schema/template 和薄 CLI；只验证帮助输出，未运行迁移 | `../manage/迁移说明.md` |
 | P14 | local complete | 本机交接材料与最终验收副本已收口；目标机未知 | 目标机交接与 production 启用待后续独立完成 |
 ## 人工交接要点
 ### active_context
-已接受的各阶段范围与边界见 `../manage/feature-status.json` 及 `../manage/HANDOFF.md`。S08 本机 Qwen 固定资源和指定短句 VoiceDesign→Base 技术链已 ACCEPTED / phasecomplete（sequence 189）；S08 acceptance hash 为 `e081820a7d9e52273773dd9e5972568a1a351c3c9399e969aaddff965bcada28`，supplement-03 handoff-v2 是信息性交接页，hash `fe72a2ea103c1762257f37dbdab298212e425ab487325313b74fb4cd3532685d`。S06 partial/blocked 和 supplement-03-v1 保留历史，不覆盖。当前没有待办的HexiPlan审批或模型验证；保留 local_trial 与所有外部/production边界。
+已接受的各阶段范围与边界见 `../manage/feature-status.json` 及 `../manage/HANDOFF.md`。S10 三段参考试听技术范围已 ACCEPTED / phasecomplete（sequence 241），canonical hash `07d9495d7c7c956b3415aa90655ca906e438eb8e3404549efa16afa9a64c98dc`；S09 “太成熟”的主观拒绝保留，S10 主观选择仍待用户反馈。S06 partial/blocked、S08 acceptance 和 supplement-03 handoff-v2 保留为历史。当前没有待办的HexiPlan审批或模型验证；保留 local_trial 与所有外部/production边界。
 ### decisions
 ```json
 [
@@ -34,7 +34,7 @@
   "每日总预算8元、后台封顶6元；owner 131072 tokens/contact 32768 tokens 是尚未达成的输入容量目标，当前仅为相同数值的 UTF-8 byte 上限",
   "默认local_trial：手动、owner样本、有限任务，不自启/自动批量浏览发布",
   "小红书移除；历史源表不是当前授权，hexi与B站继续开发",
-  "本机 room_root 由 host.local.json 指定；声音来源都可以、当前无参考、不付费、默认文字除非要求",
+  "本机 room_root 由 host.local.json 指定；声音来源都可以；S10 已使用用户提供的两段参考完成三段技术试听，S09“太成熟”的拒绝保留，S10 主观选择仍待反馈；不付费，默认文字除非要求",
   "hexi用户选env.txt本机输入，Q15.b业务类别都可以；保留受限账号和私密素材排除，当前预览优先",
   "当前路径只作host-local映射，目标OS/硬件/路径未知；不重填已明确事项",
   "迁移保留人格记忆纠正/删除/作品/声线/费用，目标凭据和依赖重新核验；默认禁止外发调度",
@@ -63,14 +63,14 @@
 ```json
 [
   "owner 尚未在 Persona 页面导入 bundle 或进行 DeepSeek calibration 试聊；真人反馈与人格批准未完成",
-  "S08 两段隔离 WAV 等待 owner 主观试听/反馈；准确声音版本尚未批准",
+  "S10 三段隔离 WAV 等待用户主观相似度、Mix 听感和最终选择反馈；当前没有获批声音",
   "browser visual 为 NOT_RUN；没有真实浏览器验收",
   "P03 token 容量目标未达成；P07 adapter 已 code-ready，但真实 provider 能力、价格与图片推理未验证",
   "目标机未知不阻塞当前本机实施"
 ]
 ```
 ### next_exact_action
-如 owner 愿意，按 `../manage/prompts/语音试听.txt` 人工播放 `../manage/resources/qwen-voice-design-20261024.wav` 和 `../manage/resources/qwen-base-preview-20261024.wav` 并记录反馈；不重跑 Qwen 或资源校验。仓库内 worker 修复、定向测试和指针文档已按白名单推送到 `master`；外部 manage 报告与配置仍留在本机工作区，最终 commit/远端状态见 `../manage/HANDOFF.md`。之后仅按用户新指示推进仍待真人输入或专项验证的事项。
+如 owner 愿意，按 `../manage/prompts/语音试听.txt` 收听 `../manage/resources/qwen-voice-reference-s10-a-20261024.wav`、`qwen-voice-reference-s10-b-20261024.wav` 与 `qwen-voice-reference-s10-mix-20261024.wav`，反馈相似度、Mix 听感和最终选择；不重跑模型或资源校验。S09“太成熟”的拒绝与旧历史保留。之后仅按用户新指示推进仍待真人输入或专项验证的事项。
 ### accepted_not_implemented
 ```json
 [
